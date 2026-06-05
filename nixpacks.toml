@@ -1,5 +1,11 @@
-[build]
-cmd = "npm install && npm run build"
+[providers]
+  nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.05"
+
+[phases.setup]
+  cmds = ["npm install"]
+
+[phases.build]
+  cmds = ["npm run build"]
 
 [start]
-cmd = "node dist/index.js"
+  cmd = "node dist/index.js"
