@@ -3,52 +3,213 @@ import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
 import http from "http";
 
-// ─── Env ────────────────────────────────────────────────────────────────────
-const SHOPIFY_STORE = process.env.SHOPIFY_STORE!; // e.g. "my-store.myshopify.com"
-const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN!;
+// ─── Multi-store config ──────────────────────────────────────────────────────
+// Supports up to 3 stores via:
+//   STORE1_DOMAIN, STORE1_TOKEN, STORE1_NAME (optional label)
+//   STORE2_DOMAIN, STORE2_TOKEN, STORE2_NAME
+//   STORE3_DOMAIN, STORE3_TOKEN, STORE3_NAME
+// Legacy single-store: SHOPIFY_STORE + SHOPIFY_ACCESS_TOKEN (maps to store "1")
+
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-07";
 const PORT = parseInt(process.env.PORT || "3000");
 
-if (!SHOPIFY_STORE || !SHOPIFY_ACCESS_TOKEN) {
-  console.error("Missing SHOPIFY_STORE or SHOPIFY_ACCESS_TOKEN");
-  process.exit(1);
+interface StoreConfig {
+  key: string; // "1", "2", "3"
+  name: string; // human label
+  domain: string;
+  token: string;
 }
+
+function loadStores(): StoreConfig[] {
+  const stores: StoreConfig[] = [];
+
+  // Multi-store env vars
+  for (let i = 1; i <= 3; i++) {
+    const domain = process.env[`STORE${i}_DOMAIN`] || (i === 1 ? process.env.SHOPIFY_STORE : undefined);
+    const token = process.env[`STORE${i}_TOKEN`] || (i === 1 ? process.env.SHOPIFY_ACCESS_TOKEN : undefined);
+    const name = process.env[`STORE${i}_NAME`] || `Store ${i}`;
+    if (domain && token) stores.push({ key: String(i), name, domain, token });
+  }
+
+  if (stores.length === 0) {
+    console.error("No stores configured. Set STORE1_DOMAIN + STORE1_TOKEN (or SHOPIFY_STORE + SHOPIFY_ACCESS_TOKEN).");
+    process.exit(1);
+  }
+  return stores;
+}
+
+const STORES = loadStores();
+console.log(`Loaded ${STORES.length} store(s): ${STORES.map((s) => s.name).join(", ")}`);
 
 // ─── Shopify GraphQL client ──────────────────────────────────────────────────
 async function shopifyGql(
+  store: StoreConfig,
   query: string,
   variables: Record<string, unknown> = {}
 ): Promise<{ data?: Record<string, unknown>; errors?: unknown[] }> {
-  const url = `https://${SHOPIFY_STORE}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
+  const url = `https://${store.domain}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
   const res = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
+      "X-Shopify-Access-Token": store.token,
     },
     body: JSON.stringify({ query, variables }),
   });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Shopify HTTP ${res.status}: ${text}`);
-  }
+  if (!res.ok) throw new Error(`[${store.name}] Shopify HTTP ${res.status}: ${await res.text()}`);
   return res.json() as Promise<{ data?: Record<string, unknown>; errors?: unknown[] }>;
 }
 
 function ok(data: unknown): { content: [{ type: "text"; text: string }] } {
   return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
 }
-
 function err(msg: string): { content: [{ type: "text"; text: string }] } {
   return { content: [{ type: "text", text: `ERROR: ${msg}` }] };
 }
 
+// Resolve store by key ("1","2","3") or name, defaulting to first store
+function resolveStore(storeKey?: string): StoreConfig {
+  if (!storeKey) return STORES[0];
+  return (
+    STORES.find((s) => s.key === storeKey || s.name.toLowerCase() === storeKey.toLowerCase()) ||
+    STORES[0]
+  );
+}
+
+function storeSchema() {
+  const keys = STORES.map((s) => s.key);
+  const names = STORES.map((s) => s.name);
+  const allOptions = [...new Set([...keys, ...names])];
+  return z
+    .string()
+    .optional()
+    .describe(
+      `Which store to use. Options: ${STORES.map((s) => `"${s.key}" (${s.name})`).join(", ")}. Defaults to "${STORES[0].name}".`
+    );
+}
+
 // ─── Server factory ──────────────────────────────────────────────────────────
 function createMcpServer(): McpServer {
-  const server = new McpServer({
-    name: "supliful-mcp",
-    version: "1.0.0",
-  });
+  const server = new McpServer({ name: "supliful-mcp", version: "2.0.0" });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MULTI-STORE MANAGEMENT
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  server.registerTool(
+    "supliful_list_stores",
+    { description: "List all configured Shopify stores connected to this Supliful MCP server.", inputSchema: {} },
+    async () => ok(STORES.map((s) => ({ key: s.key, name: s.name, domain: s.domain })))
+  );
+
+  server.registerTool(
+    "supliful_cross_store_order_search",
+    {
+      description: "Search for orders by customer email across ALL connected stores simultaneously.",
+      inputSchema: {
+        email: z.string().email().describe("Customer email to search for"),
+        first: z.number().optional().default(10),
+      },
+    },
+    async ({ email, first }) => {
+      const results: Record<string, unknown> = {};
+      for (const store of STORES) {
+        try {
+          const res = await shopifyGql(store, `
+            query CrossStoreSearch($query: String!, $first: Int!) {
+              orders(first: $first, query: $query, sortKey: CREATED_AT, reverse: true) {
+                edges {
+                  node {
+                    id name email createdAt displayFulfillmentStatus displayFinancialStatus
+                    totalPriceSet { shopMoney { amount currencyCode } }
+                    lineItems(first: 5) { edges { node { title quantity sku } } }
+                  }
+                }
+              }
+            }`, { query: `email:${email}`, first });
+          results[`${store.key}_${store.name}`] = res.errors ? { error: res.errors } : res.data?.orders;
+        } catch (e) {
+          results[`${store.key}_${store.name}`] = { error: String(e) };
+        }
+      }
+      return ok(results);
+    }
+  );
+
+  server.registerTool(
+    "supliful_cross_store_unfulfilled_summary",
+    {
+      description: "Get a summary of unfulfilled paid orders across ALL stores at once.",
+      inputSchema: {},
+    },
+    async () => {
+      const results: Record<string, unknown> = {};
+      for (const store of STORES) {
+        try {
+          const res = await shopifyGql(store, `
+            query UnfulfilledSummary {
+              orders(first: 50, query: "fulfillment_status:unfulfilled financial_status:paid") {
+                edges {
+                  node {
+                    id name createdAt
+                    totalPriceSet { shopMoney { amount currencyCode } }
+                    shippingAddress { country }
+                    lineItems(first: 5) { edges { node { title quantity } } }
+                  }
+                }
+                pageInfo { hasNextPage }
+              }
+            }`);
+          const edges = (res.data?.orders as { edges: unknown[]; pageInfo: { hasNextPage: boolean } })?.edges || [];
+          results[`${store.key}_${store.name}`] = {
+            count: edges.length,
+            hasMore: (res.data?.orders as { pageInfo: { hasNextPage: boolean } })?.pageInfo?.hasNextPage,
+            orders: edges,
+          };
+        } catch (e) {
+          results[`${store.key}_${store.name}`] = { error: String(e) };
+        }
+      }
+      return ok(results);
+    }
+  );
+
+  server.registerTool(
+    "supliful_cross_store_sales_comparison",
+    {
+      description: "Compare sales across all stores for a given date range.",
+      inputSchema: {
+        startDate: z.string().describe("ISO date e.g. 2025-01-01"),
+        endDate: z.string().describe("ISO date e.g. 2025-12-31"),
+      },
+    },
+    async ({ startDate, endDate }) => {
+      const q = `created_at:>=${startDate} created_at:<=${endDate} financial_status:paid`;
+      const results: Record<string, unknown> = {};
+      for (const store of STORES) {
+        try {
+          const res = await shopifyGql(store, `
+            query StoreSales($query: String!) {
+              orders(first: 250, query: $query) {
+                edges { node { totalPriceSet { shopMoney { amount currencyCode } } } }
+                pageInfo { hasNextPage }
+              }
+            }`, { query: q });
+          const edges = (res.data?.orders as { edges: { node: { totalPriceSet: { shopMoney: { amount: string; currencyCode: string } } } }[] })?.edges || [];
+          const total = edges.reduce((s, e) => s + parseFloat(e.node.totalPriceSet.shopMoney.amount), 0);
+          results[`${store.key}_${store.name}`] = {
+            orderCount: edges.length,
+            totalRevenue: total.toFixed(2),
+            currency: edges[0]?.node.totalPriceSet.shopMoney.currencyCode ?? "USD",
+            hasMore: (res.data?.orders as { pageInfo: { hasNextPage: boolean } })?.pageInfo?.hasNextPage,
+          };
+        } catch (e) {
+          results[`${store.key}_${store.name}`] = { error: String(e) };
+        }
+      }
+      return ok({ period: { startDate, endDate }, stores: results });
+    }
+  );
 
   // ═══════════════════════════════════════════════════════════════════════════
   // PRODUCTS
@@ -57,114 +218,80 @@ function createMcpServer(): McpServer {
   server.registerTool(
     "supliful_list_products",
     {
-      description:
-        "List all products published from Supliful to Shopify. Supports pagination and filtering by status.",
+      description: "List products published from Supliful to Shopify.",
       inputSchema: {
-        first: z.number().optional().default(50).describe("Number of products to fetch (max 250)"),
-        after: z.string().optional().describe("Cursor for pagination (endCursor from previous response)"),
-        status: z
-          .enum(["ACTIVE", "DRAFT", "ARCHIVED"])
-          .optional()
-          .describe("Filter by product status"),
-        query: z.string().optional().describe("Free-text search query"),
+        store: storeSchema(),
+        first: z.number().optional().default(50),
+        after: z.string().optional(),
+        status: z.enum(["ACTIVE", "DRAFT", "ARCHIVED"]).optional(),
+        query: z.string().optional().describe("Free-text search"),
       },
     },
-    async ({ first, after, status, query }) => {
-      const filters: string[] = [];
-      if (status) filters.push(`status:${status}`);
-      if (query) filters.push(query);
-      const queryStr = filters.join(" AND ");
-
-      const gql = `
-        query ListProducts($first: Int!, $after: String, $query: String) {
-          products(first: $first, after: $after, query: $query) {
-            edges {
-              node {
-                id
-                title
-                handle
-                status
-                descriptionHtml
-                totalInventory
-                createdAt
-                updatedAt
-                tags
-                productType
-                vendor
-                images(first: 5) {
-                  edges { node { url altText } }
-                }
-                variants(first: 20) {
-                  edges {
-                    node {
-                      id
-                      title
-                      price
-                      compareAtPrice
-                      sku
-                      weight
-                      weightUnit
-                      availableForSale
-                      inventoryItem {
-                        id
-                        tracked
-                        fulfillmentService { serviceName handle }
+    async ({ store: storeKey, first, after, status, query }) => {
+      const store = resolveStore(storeKey);
+      const filters = [status ? `status:${status}` : "", query || ""].filter(Boolean).join(" AND ");
+      try {
+        const res = await shopifyGql(store, `
+          query ListProducts($first: Int!, $after: String, $query: String) {
+            products(first: $first, after: $after, query: $query) {
+              edges {
+                node {
+                  id title handle status descriptionHtml totalInventory createdAt updatedAt tags productType vendor
+                  images(first: 5) { edges { node { url altText } } }
+                  variants(first: 20) {
+                    edges {
+                      node {
+                        id title price compareAtPrice sku weight weightUnit availableForSale
+                        inventoryItem { id tracked fulfillmentService { serviceName handle } }
                       }
                     }
                   }
                 }
               }
+              pageInfo { hasNextPage endCursor }
             }
-            pageInfo { hasNextPage endCursor }
-          }
-        }`;
-
-      try {
-        const res = await shopifyGql(gql, { first, after, query: queryStr || undefined });
+          }`, { first, after, query: filters || undefined });
         if (res.errors) return err(JSON.stringify(res.errors));
-        return ok(res.data?.products);
-      } catch (e: unknown) {
-        return err(String(e));
-      }
+        return ok({ store: store.name, ...res.data?.products as object });
+      } catch (e) { return err(String(e)); }
     }
   );
 
   server.registerTool(
     "supliful_get_product",
     {
-      description: "Get full details of a single Shopify/Supliful product by its GID.",
+      description: "Get full details of a Supliful product by its Shopify GID.",
       inputSchema: {
-        id: z.string().describe("Product GID e.g. gid://shopify/Product/123456"),
+        store: storeSchema(),
+        id: z.string().describe("Product GID e.g. gid://shopify/Product/123"),
       },
     },
-    async ({ id }) => {
-      const gql = `
-        query GetProduct($id: ID!) {
-          product(id: $id) {
-            id title handle status descriptionHtml tags productType vendor
-            createdAt updatedAt totalInventory
-            images(first: 10) { edges { node { url altText } } }
-            variants(first: 30) {
-              edges {
-                node {
-                  id title price compareAtPrice sku weight weightUnit barcode availableForSale
-                  inventoryItem {
-                    id tracked measurement { weight { unit value } }
-                    fulfillmentService { serviceName handle }
+    async ({ store: storeKey, id }) => {
+      const store = resolveStore(storeKey);
+      try {
+        const res = await shopifyGql(store, `
+          query GetProduct($id: ID!) {
+            product(id: $id) {
+              id title handle status descriptionHtml tags productType vendor createdAt updatedAt totalInventory
+              images(first: 10) { edges { node { url altText } } }
+              variants(first: 30) {
+                edges {
+                  node {
+                    id title price compareAtPrice sku weight weightUnit barcode availableForSale
+                    inventoryItem {
+                      id tracked measurement { weight { unit value } }
+                      fulfillmentService { serviceName handle }
+                    }
                   }
                 }
               }
+              metafields(first: 20) { edges { node { namespace key value type } } }
+              seo { title description }
             }
-            metafields(first: 20) { edges { node { namespace key value type } } }
-          }
-        }`;
-      try {
-        const res = await shopifyGql(gql, { id });
+          }`, { id });
         if (res.errors) return err(JSON.stringify(res.errors));
         return ok(res.data?.product);
-      } catch (e: unknown) {
-        return err(String(e));
-      }
+      } catch (e) { return err(String(e)); }
     }
   );
 
@@ -173,30 +300,125 @@ function createMcpServer(): McpServer {
     {
       description: "Search for Supliful products by SKU.",
       inputSchema: {
-        sku: z.string().describe("SKU to search for"),
+        store: storeSchema(),
+        sku: z.string(),
       },
     },
-    async ({ sku }) => {
-      const gql = `
-        query SearchBySku($query: String!) {
-          products(first: 10, query: $query) {
-            edges {
-              node {
-                id title status
-                variants(first: 10) {
-                  edges { node { id sku title price } }
+    async ({ store: storeKey, sku }) => {
+      const store = resolveStore(storeKey);
+      try {
+        const res = await shopifyGql(store, `
+          query SearchBySku($query: String!) {
+            products(first: 10, query: $query) {
+              edges {
+                node {
+                  id title status
+                  variants(first: 10) { edges { node { id sku title price } } }
                 }
               }
             }
-          }
-        }`;
-      try {
-        const res = await shopifyGql(gql, { query: `sku:${sku}` });
+          }`, { query: `sku:${sku}` });
         if (res.errors) return err(JSON.stringify(res.errors));
         return ok(res.data?.products);
-      } catch (e: unknown) {
-        return err(String(e));
-      }
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
+  server.registerTool(
+    "supliful_list_collections",
+    {
+      description: "List all Shopify collections (product groups) in a store.",
+      inputSchema: {
+        store: storeSchema(),
+        first: z.number().optional().default(30),
+      },
+    },
+    async ({ store: storeKey, first }) => {
+      const store = resolveStore(storeKey);
+      try {
+        const res = await shopifyGql(store, `
+          query ListCollections($first: Int!) {
+            collections(first: $first) {
+              edges {
+                node {
+                  id title handle updatedAt
+                  productsCount { count }
+                  image { url altText }
+                }
+              }
+              pageInfo { hasNextPage endCursor }
+            }
+          }`, { first });
+        if (res.errors) return err(JSON.stringify(res.errors));
+        return ok(res.data?.collections);
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
+  server.registerTool(
+    "supliful_update_product",
+    {
+      description: "Update a product's title, description, tags, SEO, or status.",
+      inputSchema: {
+        store: storeSchema(),
+        id: z.string().describe("Product GID"),
+        title: z.string().optional(),
+        descriptionHtml: z.string().optional(),
+        tags: z.array(z.string()).optional(),
+        status: z.enum(["ACTIVE", "DRAFT", "ARCHIVED"]).optional(),
+        seoTitle: z.string().optional(),
+        seoDescription: z.string().optional(),
+      },
+    },
+    async ({ store: storeKey, id, title, descriptionHtml, tags, status, seoTitle, seoDescription }) => {
+      const store = resolveStore(storeKey);
+      const input: Record<string, unknown> = { id };
+      if (title !== undefined) input.title = title;
+      if (descriptionHtml !== undefined) input.descriptionHtml = descriptionHtml;
+      if (tags !== undefined) input.tags = tags;
+      if (status !== undefined) input.status = status;
+      if (seoTitle || seoDescription) input.seo = { title: seoTitle, description: seoDescription };
+      try {
+        const res = await shopifyGql(store, `
+          mutation UpdateProduct($input: ProductInput!) {
+            productUpdate(input: $input) {
+              product { id title status tags }
+              userErrors { field message }
+            }
+          }`, { input });
+        if (res.errors) return err(JSON.stringify(res.errors));
+        return ok(res.data?.productUpdate);
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
+  server.registerTool(
+    "supliful_update_variant_price",
+    {
+      description: "Update price and compareAtPrice for a product variant.",
+      inputSchema: {
+        store: storeSchema(),
+        productId: z.string().describe("Product GID"),
+        variants: z.array(z.object({
+          id: z.string().describe("Variant GID"),
+          price: z.string().optional().describe("e.g. '29.99'"),
+          compareAtPrice: z.string().optional().describe("Original price for strikethrough"),
+        })),
+      },
+    },
+    async ({ store: storeKey, productId, variants }) => {
+      const store = resolveStore(storeKey);
+      try {
+        const res = await shopifyGql(store, `
+          mutation UpdateVariants($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+            productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+              productVariants { id price compareAtPrice }
+              userErrors { field message }
+            }
+          }`, { productId, variants });
+        if (res.errors) return err(JSON.stringify(res.errors));
+        return ok(res.data?.productVariantsBulkUpdate);
+      } catch (e) { return err(String(e)); }
     }
   );
 
@@ -207,176 +429,152 @@ function createMcpServer(): McpServer {
   server.registerTool(
     "supliful_list_orders",
     {
-      description:
-        "List orders in Shopify that are routed to Supliful for fulfillment. Supports filtering by status, date, and financial status.",
+      description: "List Shopify orders routed to Supliful for fulfillment.",
       inputSchema: {
-        first: z.number().optional().default(25).describe("Number of orders (max 250)"),
-        after: z.string().optional().describe("Pagination cursor"),
-        query: z
-          .string()
-          .optional()
-          .describe(
-            "Shopify order search query e.g. 'fulfillment_status:unfulfilled financial_status:paid'"
-          ),
-        sortKey: z
-          .enum(["CREATED_AT", "UPDATED_AT", "PROCESSED_AT", "TOTAL_PRICE", "ID"])
-          .optional()
-          .default("CREATED_AT"),
+        store: storeSchema(),
+        first: z.number().optional().default(25),
+        after: z.string().optional(),
+        query: z.string().optional().describe("e.g. 'fulfillment_status:unfulfilled financial_status:paid created_at:>=2025-01-01'"),
+        sortKey: z.enum(["CREATED_AT", "UPDATED_AT", "PROCESSED_AT", "TOTAL_PRICE", "ID"]).optional().default("CREATED_AT"),
         reverse: z.boolean().optional().default(true),
       },
     },
-    async ({ first, after, query, sortKey, reverse }) => {
-      const gql = `
-        query ListOrders($first: Int!, $after: String, $query: String, $sortKey: OrderSortKeys, $reverse: Boolean) {
-          orders(first: $first, after: $after, query: $query, sortKey: $sortKey, reverse: $reverse) {
-            edges {
-              node {
-                id name email phone
-                createdAt processedAt updatedAt closedAt cancelledAt
-                displayFinancialStatus displayFulfillmentStatus
-                totalPriceSet { shopMoney { amount currencyCode } }
-                subtotalPriceSet { shopMoney { amount currencyCode } }
-                totalShippingPriceSet { shopMoney { amount currencyCode } }
-                lineItems(first: 20) {
-                  edges {
-                    node {
-                      id title quantity sku
-                      originalUnitPriceSet { shopMoney { amount currencyCode } }
-                      variant { id sku inventoryItem { fulfillmentService { serviceName } } }
-                    }
-                  }
-                }
-                shippingAddress { firstName lastName address1 address2 city province country zip phone }
-                fulfillmentOrders(first: 5) {
-                  edges {
-                    node {
-                      id status requestStatus
-                      fulfillments(first: 5) {
-                        edges { node { id status trackingInfo { number url company } } }
+    async ({ store: storeKey, first, after, query, sortKey, reverse }) => {
+      const store = resolveStore(storeKey);
+      try {
+        const res = await shopifyGql(store, `
+          query ListOrders($first: Int!, $after: String, $query: String, $sortKey: OrderSortKeys, $reverse: Boolean) {
+            orders(first: $first, after: $after, query: $query, sortKey: $sortKey, reverse: $reverse) {
+              edges {
+                node {
+                  id name email phone createdAt processedAt updatedAt closedAt cancelledAt
+                  displayFinancialStatus displayFulfillmentStatus
+                  totalPriceSet { shopMoney { amount currencyCode } }
+                  subtotalPriceSet { shopMoney { amount currencyCode } }
+                  totalShippingPriceSet { shopMoney { amount currencyCode } }
+                  lineItems(first: 20) {
+                    edges {
+                      node {
+                        id title quantity sku
+                        originalUnitPriceSet { shopMoney { amount currencyCode } }
+                        variant { id sku inventoryItem { fulfillmentService { serviceName } } }
                       }
                     }
                   }
+                  shippingAddress { firstName lastName address1 address2 city province country zip phone }
+                  fulfillmentOrders(first: 5) {
+                    edges {
+                      node {
+                        id status requestStatus
+                        fulfillments(first: 5) {
+                          edges { node { id status trackingInfo { number url company } } }
+                        }
+                      }
+                    }
+                  }
+                  note tags customAttributes { key value }
                 }
-                note
-                tags
-                customAttributes { key value }
               }
+              pageInfo { hasNextPage endCursor }
             }
-            pageInfo { hasNextPage endCursor }
-          }
-        }`;
-      try {
-        const res = await shopifyGql(gql, { first, after, query, sortKey, reverse });
+          }`, { first, after, query, sortKey, reverse });
         if (res.errors) return err(JSON.stringify(res.errors));
-        return ok(res.data?.orders);
-      } catch (e: unknown) {
-        return err(String(e));
-      }
+        return ok({ store: store.name, ...res.data?.orders as object });
+      } catch (e) { return err(String(e)); }
     }
   );
 
   server.registerTool(
     "supliful_get_order",
     {
-      description: "Get full details of a single order by its Shopify GID or order name (#1234).",
+      description: "Get full order details by GID or order name (#1234).",
       inputSchema: {
-        id: z.string().describe("Order GID e.g. gid://shopify/Order/12345 or order name like #1234"),
+        store: storeSchema(),
+        id: z.string().describe("Order GID or '#1234' name"),
       },
     },
-    async ({ id }) => {
-      // Handle order name lookup
-      const isName = id.startsWith("#") || /^\d+$/.test(id);
-      if (isName) {
-        const name = id.startsWith("#") ? id : `#${id}`;
-        const searchGql = `
-          query FindOrder($query: String!) {
-            orders(first: 1, query: $query) {
-              edges { node { id name } }
-            }
-          }`;
-        const searchRes = await shopifyGql(searchGql, { query: `name:${name}` });
-        const edges = (searchRes.data?.orders as { edges: { node: { id: string } }[] })?.edges;
-        if (!edges?.length) return err(`Order ${name} not found`);
-        id = edges[0].node.id;
-      }
-
-      const gql = `
-        query GetOrder($id: ID!) {
-          order(id: $id) {
-            id name email phone note tags
-            createdAt processedAt updatedAt closedAt cancelledAt cancelReason
-            displayFinancialStatus displayFulfillmentStatus
-            totalPriceSet { shopMoney { amount currencyCode } }
-            subtotalPriceSet { shopMoney { amount currencyCode } }
-            totalTaxSet { shopMoney { amount currencyCode } }
-            totalShippingPriceSet { shopMoney { amount currencyCode } }
-            totalDiscountsSet { shopMoney { amount currencyCode } }
-            customer { id email firstName lastName phone }
-            shippingAddress { firstName lastName company address1 address2 city province country zip phone }
-            billingAddress { firstName lastName company address1 address2 city province country zip phone }
-            lineItems(first: 30) {
-              edges {
-                node {
-                  id title quantity sku refundableQuantity
-                  originalUnitPriceSet { shopMoney { amount currencyCode } }
-                  discountedUnitPriceSet { shopMoney { amount currencyCode } }
-                  variant { id sku title price inventoryItem { fulfillmentService { serviceName handle } } }
+    async ({ store: storeKey, id }) => {
+      const store = resolveStore(storeKey);
+      try {
+        let orderId = id;
+        if (id.startsWith("#") || /^\d+$/.test(id)) {
+          const name = id.startsWith("#") ? id : `#${id}`;
+          const searchRes = await shopifyGql(store, `
+            query FindOrder($query: String!) {
+              orders(first: 1, query: $query) { edges { node { id } } }
+            }`, { query: `name:${name}` });
+          const edges = (searchRes.data?.orders as { edges: { node: { id: string } }[] })?.edges;
+          if (!edges?.length) return err(`Order ${name} not found in ${store.name}`);
+          orderId = edges[0].node.id;
+        }
+        const res = await shopifyGql(store, `
+          query GetOrder($id: ID!) {
+            order(id: $id) {
+              id name email phone note tags
+              createdAt processedAt updatedAt closedAt cancelledAt cancelReason
+              displayFinancialStatus displayFulfillmentStatus
+              totalPriceSet { shopMoney { amount currencyCode } }
+              subtotalPriceSet { shopMoney { amount currencyCode } }
+              totalTaxSet { shopMoney { amount currencyCode } }
+              totalShippingPriceSet { shopMoney { amount currencyCode } }
+              totalDiscountsSet { shopMoney { amount currencyCode } }
+              customer { id email firstName lastName phone }
+              shippingAddress { firstName lastName company address1 address2 city province country zip phone }
+              billingAddress { firstName lastName company address1 address2 city province country zip phone }
+              lineItems(first: 30) {
+                edges {
+                  node {
+                    id title quantity sku refundableQuantity
+                    originalUnitPriceSet { shopMoney { amount currencyCode } }
+                    discountedUnitPriceSet { shopMoney { amount currencyCode } }
+                    variant { id sku title price inventoryItem { fulfillmentService { serviceName handle } } }
+                  }
                 }
               }
-            }
-            fulfillmentOrders(first: 10) {
-              edges {
-                node {
-                  id status requestStatus
-                  assignedLocation { name address { address1 city country } }
-                  lineItems(first: 20) {
-                    edges { node { id remainingQuantity lineItem { title sku } } }
-                  }
-                  fulfillments(first: 10) {
-                    edges {
-                      node {
-                        id status
-                        createdAt updatedAt
-                        trackingInfo { number url company }
+              fulfillmentOrders(first: 10) {
+                edges {
+                  node {
+                    id status requestStatus
+                    assignedLocation { name address { address1 city country } }
+                    lineItems(first: 20) {
+                      edges { node { id remainingQuantity lineItem { title sku } } }
+                    }
+                    fulfillments(first: 10) {
+                      edges {
+                        node {
+                          id status createdAt updatedAt
+                          trackingInfo { number url company }
+                        }
                       }
                     }
                   }
                 }
               }
+              transactions(first: 10) {
+                edges { node { id status kind gateway processedAt amountSet { shopMoney { amount currencyCode } } } }
+              }
+              customAttributes { key value }
+              refunds(first: 5) {
+                edges { node { id createdAt note totalRefundedSet { shopMoney { amount currencyCode } } } }
+              }
             }
-            transactions(first: 10) {
-              edges { node { id status kind gateway processedAt amountSet { shopMoney { amount currencyCode } } } }
-            }
-            customAttributes { key value }
-            refunds(first: 5) {
-              edges { node { id createdAt note totalRefundedSet { shopMoney { amount currencyCode } } } }
-            }
-          }
-        }`;
-      try {
-        const res = await shopifyGql(gql, { id });
+          }`, { id: orderId });
         if (res.errors) return err(JSON.stringify(res.errors));
-        return ok(res.data?.order);
-      } catch (e: unknown) {
-        return err(String(e));
-      }
+        return ok({ store: store.name, ...res.data?.order as object });
+      } catch (e) { return err(String(e)); }
     }
   );
 
   server.registerTool(
     "supliful_create_order",
     {
-      description:
-        "Create a Shopify order that Supliful will automatically fulfill. Requires variant IDs from Supliful products published to Shopify.",
+      description: "Create a Shopify order that Supliful will automatically fulfill.",
       inputSchema: {
-        lineItems: z
-          .array(
-            z.object({
-              variantId: z.string().describe("Shopify variant GID e.g. gid://shopify/ProductVariant/123"),
-              quantity: z.number().int().min(1),
-            })
-          )
-          .describe("Items to order"),
+        store: storeSchema(),
+        lineItems: z.array(z.object({
+          variantId: z.string().describe("Shopify variant GID"),
+          quantity: z.number().int().min(1),
+        })),
         shippingAddress: z.object({
           firstName: z.string(),
           lastName: z.string(),
@@ -387,155 +585,170 @@ function createMcpServer(): McpServer {
           countryCode: z.string(),
           zip: z.string(),
           phone: z.string().describe("Required by Supliful"),
+          company: z.string().optional(),
         }),
-        email: z.string().email().describe("Customer email - required by Supliful"),
-        phone: z.string().describe("Customer phone - required by Supliful"),
-        internalOrderId: z.string().optional().describe("Your internal order ID stored in note and customAttributes"),
-        customerId: z.string().optional().describe("Shopify customer GID to associate with order"),
+        email: z.string().email().describe("Required by Supliful"),
+        phone: z.string().describe("Required by Supliful"),
+        internalOrderId: z.string().optional(),
+        customerId: z.string().optional().describe("Shopify customer GID"),
         note: z.string().optional(),
         financialStatus: z.enum(["PENDING", "PAID"]).optional().default("PAID"),
         sendReceipt: z.boolean().optional().default(false),
+        tags: z.array(z.string()).optional(),
       },
     },
-    async ({
-      lineItems,
-      shippingAddress,
-      email,
-      phone,
-      internalOrderId,
-      customerId,
-      note,
-      financialStatus,
-      sendReceipt,
-    }) => {
-      const orderNote = [note, internalOrderId ? `Internal ID: ${internalOrderId}` : ""]
-        .filter(Boolean)
-        .join(" | ");
-      const customAttributes = internalOrderId
-        ? [{ key: "internal_order_id", value: internalOrderId }]
-        : [];
-
-      const gql = `
-        mutation CreateOrder($order: OrderCreateOrderInput!) {
-          orderCreate(order: $order) {
-            order {
-              id name displayFinancialStatus displayFulfillmentStatus
-              totalPriceSet { shopMoney { amount currencyCode } }
-              customer { id email }
-            }
-            userErrors { field message }
-          }
-        }`;
-
+    async ({ store: storeKey, lineItems, shippingAddress, email, phone, internalOrderId, customerId, note, financialStatus, sendReceipt, tags }) => {
+      const store = resolveStore(storeKey);
+      const orderNote = [note, internalOrderId ? `Internal ID: ${internalOrderId}` : ""].filter(Boolean).join(" | ");
+      const customAttributes = internalOrderId ? [{ key: "internal_order_id", value: internalOrderId }] : [];
       const orderInput: Record<string, unknown> = {
-        lineItems,
-        shippingAddress,
-        billingAddress: shippingAddress,
-        email,
-        phone,
-        note: orderNote,
-        financialStatus,
-        sendReceipt,
-        sendFulfillmentReceipt: false,
-        customAttributes,
+        lineItems, shippingAddress, billingAddress: shippingAddress,
+        email, phone, note: orderNote, financialStatus, sendReceipt,
+        sendFulfillmentReceipt: false, customAttributes, tags,
       };
       if (customerId) orderInput.customerToAssociate = customerId;
-
       try {
-        const res = await shopifyGql(gql, { order: orderInput });
+        const res = await shopifyGql(store, `
+          mutation CreateOrder($order: OrderCreateOrderInput!) {
+            orderCreate(order: $order) {
+              order {
+                id name displayFinancialStatus displayFulfillmentStatus
+                totalPriceSet { shopMoney { amount currencyCode } }
+                customer { id email }
+              }
+              userErrors { field message }
+            }
+          }`, { order: orderInput });
         if (res.errors) return err(JSON.stringify(res.errors));
         const result = res.data?.orderCreate as { userErrors?: { field: string; message: string }[] };
         if (result?.userErrors?.length) return err(JSON.stringify(result.userErrors));
-        return ok(res.data?.orderCreate);
-      } catch (e: unknown) {
-        return err(String(e));
-      }
+        return ok({ store: store.name, ...result });
+      } catch (e) { return err(String(e)); }
     }
   );
 
   server.registerTool(
     "supliful_cancel_order",
     {
-      description: "Cancel a Shopify order that has not yet been fulfilled by Supliful.",
+      description: "Cancel a Shopify order not yet fulfilled by Supliful.",
       inputSchema: {
-        orderId: z.string().describe("Order GID e.g. gid://shopify/Order/12345"),
-        reason: z
-          .enum(["CUSTOMER", "FRAUD", "INVENTORY", "DECLINED", "OTHER"])
-          .optional()
-          .default("OTHER"),
-        refund: z.boolean().optional().default(true).describe("Issue a refund if applicable"),
+        store: storeSchema(),
+        orderId: z.string(),
+        reason: z.enum(["CUSTOMER", "FRAUD", "INVENTORY", "DECLINED", "OTHER"]).optional().default("OTHER"),
+        refund: z.boolean().optional().default(true),
         notifyCustomer: z.boolean().optional().default(false),
       },
     },
-    async ({ orderId, reason, refund, notifyCustomer }) => {
-      const gql = `
-        mutation CancelOrder($orderId: ID!, $reason: OrderCancelReason!, $refund: Boolean!, $notifyCustomer: Boolean!) {
-          orderCancel(orderId: $orderId, reason: $reason, refund: $refund, notifyCustomer: $notifyCustomer) {
-            orderCancelUserErrors { field message code }
-            userErrors { field message }
-          }
-        }`;
+    async ({ store: storeKey, orderId, reason, refund, notifyCustomer }) => {
+      const store = resolveStore(storeKey);
       try {
-        const res = await shopifyGql(gql, { orderId, reason, refund, notifyCustomer });
+        const res = await shopifyGql(store, `
+          mutation CancelOrder($orderId: ID!, $reason: OrderCancelReason!, $refund: Boolean!, $notifyCustomer: Boolean!) {
+            orderCancel(orderId: $orderId, reason: $reason, refund: $refund, notifyCustomer: $notifyCustomer) {
+              orderCancelUserErrors { field message code }
+              userErrors { field message }
+            }
+          }`, { orderId, reason, refund, notifyCustomer });
         if (res.errors) return err(JSON.stringify(res.errors));
         return ok(res.data?.orderCancel);
-      } catch (e: unknown) {
-        return err(String(e));
-      }
+      } catch (e) { return err(String(e)); }
     }
   );
 
   server.registerTool(
-    "supliful_add_order_note",
+    "supliful_update_order",
     {
-      description: "Add or update a note on an existing Shopify order.",
+      description: "Update order note, tags, or custom attributes.",
       inputSchema: {
-        orderId: z.string().describe("Order GID"),
-        note: z.string().describe("Note text to set on the order"),
+        store: storeSchema(),
+        orderId: z.string(),
+        note: z.string().optional(),
+        tags: z.array(z.string()).optional(),
+        customAttributes: z.array(z.object({ key: z.string(), value: z.string() })).optional(),
       },
     },
-    async ({ orderId, note }) => {
-      const gql = `
-        mutation UpdateOrderNote($input: OrderInput!) {
-          orderUpdate(input: $input) {
-            order { id name note }
-            userErrors { field message }
-          }
-        }`;
+    async ({ store: storeKey, orderId, note, tags, customAttributes }) => {
+      const store = resolveStore(storeKey);
+      const input: Record<string, unknown> = { id: orderId };
+      if (note !== undefined) input.note = note;
+      if (tags !== undefined) input.tags = tags;
+      if (customAttributes !== undefined) input.customAttributes = customAttributes;
       try {
-        const res = await shopifyGql(gql, { input: { id: orderId, note } });
+        const res = await shopifyGql(store, `
+          mutation UpdateOrder($input: OrderInput!) {
+            orderUpdate(input: $input) {
+              order { id name note tags customAttributes { key value } }
+              userErrors { field message }
+            }
+          }`, { input });
         if (res.errors) return err(JSON.stringify(res.errors));
         return ok(res.data?.orderUpdate);
-      } catch (e: unknown) {
-        return err(String(e));
-      }
+      } catch (e) { return err(String(e)); }
     }
   );
 
   server.registerTool(
-    "supliful_tag_order",
+    "supliful_list_unfulfilled_orders",
     {
-      description: "Add tags to a Shopify order.",
+      description: "List all paid but unfulfilled orders (Supliful fulfillment queue).",
       inputSchema: {
-        orderId: z.string().describe("Order GID"),
-        tags: z.array(z.string()).describe("Tags to set (replaces existing tags)"),
+        store: storeSchema(),
+        first: z.number().optional().default(50),
+        after: z.string().optional(),
       },
     },
-    async ({ orderId, tags }) => {
-      const gql = `
-        mutation TagOrder($input: OrderInput!) {
-          orderUpdate(input: $input) {
-            order { id name tags }
-            userErrors { field message }
-          }
-        }`;
+    async ({ store: storeKey, first, after }) => {
+      const store = resolveStore(storeKey);
       try {
-        const res = await shopifyGql(gql, { input: { id: orderId, tags } });
+        const res = await shopifyGql(store, `
+          query UnfulfilledOrders($first: Int!, $after: String) {
+            orders(first: $first, after: $after, query: "fulfillment_status:unfulfilled financial_status:paid", sortKey: CREATED_AT, reverse: false) {
+              edges {
+                node {
+                  id name email createdAt displayFulfillmentStatus displayFinancialStatus
+                  totalPriceSet { shopMoney { amount currencyCode } }
+                  lineItems(first: 10) { edges { node { title quantity sku } } }
+                  shippingAddress { firstName lastName country }
+                }
+              }
+              pageInfo { hasNextPage endCursor }
+            }
+          }`, { first, after });
         if (res.errors) return err(JSON.stringify(res.errors));
-        return ok(res.data?.orderUpdate);
-      } catch (e: unknown) {
-        return err(String(e));
-      }
+        return ok({ store: store.name, ...res.data?.orders as object });
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
+  server.registerTool(
+    "supliful_list_orders_on_hold",
+    {
+      description: "List orders that are on hold due to payment failure or Supliful issues.",
+      inputSchema: {
+        store: storeSchema(),
+        first: z.number().optional().default(25),
+      },
+    },
+    async ({ store: storeKey, first }) => {
+      const store = resolveStore(storeKey);
+      try {
+        const res = await shopifyGql(store, `
+          query OnHoldOrders($first: Int!) {
+            orders(first: $first, query: "financial_status:pending fulfillment_status:unfulfilled") {
+              edges {
+                node {
+                  id name email createdAt displayFinancialStatus displayFulfillmentStatus
+                  totalPriceSet { shopMoney { amount currencyCode } }
+                  note tags
+                  lineItems(first: 5) { edges { node { title quantity } } }
+                }
+              }
+              pageInfo { hasNextPage }
+            }
+          }`, { first });
+        if (res.errors) return err(JSON.stringify(res.errors));
+        return ok({ store: store.name, ...res.data?.orders as object });
+      } catch (e) { return err(String(e)); }
     }
   );
 
@@ -546,37 +759,35 @@ function createMcpServer(): McpServer {
   server.registerTool(
     "supliful_get_fulfillment_orders",
     {
-      description: "Get fulfillment orders for a specific Shopify order to see Supliful fulfillment status.",
+      description: "Get Supliful fulfillment status for a specific order.",
       inputSchema: {
-        orderId: z.string().describe("Order GID e.g. gid://shopify/Order/12345"),
+        store: storeSchema(),
+        orderId: z.string(),
       },
     },
-    async ({ orderId }) => {
-      const gql = `
-        query GetFulfillmentOrders($orderId: ID!) {
-          order(id: $orderId) {
-            id name
-            fulfillmentOrders(first: 10) {
-              edges {
-                node {
-                  id status requestStatus
-                  createdAt updatedAt
-                  assignedLocation { name address { address1 city country } }
-                  lineItems(first: 20) {
-                    edges {
-                      node {
-                        id remainingQuantity totalQuantity
-                        lineItem { id title sku quantity }
-                      }
+    async ({ store: storeKey, orderId }) => {
+      const store = resolveStore(storeKey);
+      try {
+        const res = await shopifyGql(store, `
+          query GetFulfillmentOrders($orderId: ID!) {
+            order(id: $orderId) {
+              id name
+              fulfillmentOrders(first: 10) {
+                edges {
+                  node {
+                    id status requestStatus createdAt updatedAt
+                    assignedLocation { name address { address1 city country } }
+                    lineItems(first: 20) {
+                      edges { node { id remainingQuantity totalQuantity lineItem { id title sku quantity } } }
                     }
-                  }
-                  fulfillments(first: 10) {
-                    edges {
-                      node {
-                        id status createdAt updatedAt
-                        trackingInfo { number url company }
-                        fulfillmentLineItems(first: 10) {
-                          edges { node { id quantity lineItem { title sku } } }
+                    fulfillments(first: 10) {
+                      edges {
+                        node {
+                          id status createdAt updatedAt
+                          trackingInfo { number url company }
+                          fulfillmentLineItems(first: 10) {
+                            edges { node { id quantity lineItem { title sku } } }
+                          }
                         }
                       }
                     }
@@ -584,88 +795,83 @@ function createMcpServer(): McpServer {
                 }
               }
             }
-          }
-        }`;
-      try {
-        const res = await shopifyGql(gql, { orderId });
+          }`, { orderId });
         if (res.errors) return err(JSON.stringify(res.errors));
         return ok(res.data?.order);
-      } catch (e: unknown) {
-        return err(String(e));
-      }
-    }
-  );
-
-  server.registerTool(
-    "supliful_list_unfulfilled_orders",
-    {
-      description:
-        "List all orders that are paid but not yet fulfilled by Supliful. Useful for monitoring fulfillment queue.",
-      inputSchema: {
-        first: z.number().optional().default(50),
-        after: z.string().optional(),
-      },
-    },
-    async ({ first, after }) => {
-      const gql = `
-        query UnfulfilledOrders($first: Int!, $after: String) {
-          orders(first: $first, after: $after, query: "fulfillment_status:unfulfilled financial_status:paid", sortKey: CREATED_AT, reverse: false) {
-            edges {
-              node {
-                id name email createdAt displayFulfillmentStatus displayFinancialStatus
-                totalPriceSet { shopMoney { amount currencyCode } }
-                lineItems(first: 10) {
-                  edges { node { title quantity sku } }
-                }
-                shippingAddress { firstName lastName country }
-              }
-            }
-            pageInfo { hasNextPage endCursor }
-          }
-        }`;
-      try {
-        const res = await shopifyGql(gql, { first, after });
-        if (res.errors) return err(JSON.stringify(res.errors));
-        return ok(res.data?.orders);
-      } catch (e: unknown) {
-        return err(String(e));
-      }
+      } catch (e) { return err(String(e)); }
     }
   );
 
   server.registerTool(
     "supliful_get_tracking_info",
     {
-      description: "Get tracking information for a fulfilled Supliful order.",
+      description: "Get tracking numbers and URLs for a fulfilled Supliful order.",
       inputSchema: {
-        orderId: z.string().describe("Order GID e.g. gid://shopify/Order/12345"),
+        store: storeSchema(),
+        orderId: z.string(),
       },
     },
-    async ({ orderId }) => {
-      const gql = `
-        query GetTracking($orderId: ID!) {
-          order(id: $orderId) {
-            id name displayFulfillmentStatus
-            fulfillments(first: 10) {
-              edges {
-                node {
-                  id status createdAt updatedAt
-                  trackingInfo { number url company }
-                  fulfillmentLineItems(first: 10) {
-                    edges { node { id quantity lineItem { title sku } } }
+    async ({ store: storeKey, orderId }) => {
+      const store = resolveStore(storeKey);
+      try {
+        const res = await shopifyGql(store, `
+          query GetTracking($orderId: ID!) {
+            order(id: $orderId) {
+              id name displayFulfillmentStatus
+              fulfillments(first: 10) {
+                edges {
+                  node {
+                    id status createdAt updatedAt
+                    trackingInfo { number url company }
+                    fulfillmentLineItems(first: 10) {
+                      edges { node { id quantity lineItem { title sku } } }
+                    }
                   }
                 }
               }
             }
-          }
-        }`;
-      try {
-        const res = await shopifyGql(gql, { orderId });
+          }`, { orderId });
         if (res.errors) return err(JSON.stringify(res.errors));
         return ok(res.data?.order);
-      } catch (e: unknown) {
-        return err(String(e));
-      }
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
+  server.registerTool(
+    "supliful_update_shipping_address",
+    {
+      description: "Update the shipping address on an order before Supliful ships it.",
+      inputSchema: {
+        store: storeSchema(),
+        orderId: z.string(),
+        firstName: z.string().optional(),
+        lastName: z.string().optional(),
+        address1: z.string().optional(),
+        address2: z.string().optional(),
+        city: z.string().optional(),
+        provinceCode: z.string().optional(),
+        countryCode: z.string().optional(),
+        zip: z.string().optional(),
+        phone: z.string().optional(),
+        company: z.string().optional(),
+      },
+    },
+    async ({ store: storeKey, orderId, ...addressFields }) => {
+      const store = resolveStore(storeKey);
+      const shippingAddress = Object.fromEntries(
+        Object.entries(addressFields).filter(([, v]) => v !== undefined)
+      );
+      try {
+        const res = await shopifyGql(store, `
+          mutation UpdateShippingAddress($orderId: ID!, $shippingAddress: MailingAddressInput!) {
+            orderUpdate(input: { id: $orderId, shippingAddress: $shippingAddress }) {
+              order { id name shippingAddress { firstName lastName address1 city country zip phone } }
+              userErrors { field message }
+            }
+          }`, { orderId, shippingAddress });
+        if (res.errors) return err(JSON.stringify(res.errors));
+        return ok(res.data?.orderUpdate);
+      } catch (e) { return err(String(e)); }
     }
   );
 
@@ -676,8 +882,9 @@ function createMcpServer(): McpServer {
   server.registerTool(
     "supliful_create_customer",
     {
-      description: "Create a customer record in Shopify before placing a Supliful order.",
+      description: "Create a customer record in Shopify.",
       inputSchema: {
+        store: storeSchema(),
         firstName: z.string(),
         lastName: z.string(),
         email: z.string().email(),
@@ -687,55 +894,48 @@ function createMcpServer(): McpServer {
         acceptsMarketing: z.boolean().optional().default(false),
       },
     },
-    async ({ firstName, lastName, email, phone, note, tags, acceptsMarketing }) => {
-      const gql = `
-        mutation CreateCustomer($input: CustomerInput!) {
-          customerCreate(input: $input) {
-            customer { id email firstName lastName phone }
-            userErrors { field message }
-          }
-        }`;
+    async ({ store: storeKey, firstName, lastName, email, phone, note, tags, acceptsMarketing }) => {
+      const store = resolveStore(storeKey);
       try {
-        const res = await shopifyGql(gql, {
-          input: { firstName, lastName, email, phone, note, tags, acceptsMarketing },
-        });
+        const res = await shopifyGql(store, `
+          mutation CreateCustomer($input: CustomerInput!) {
+            customerCreate(input: $input) {
+              customer { id email firstName lastName phone }
+              userErrors { field message }
+            }
+          }`, { input: { firstName, lastName, email, phone, note, tags, acceptsMarketing } });
         if (res.errors) return err(JSON.stringify(res.errors));
         return ok(res.data?.customerCreate);
-      } catch (e: unknown) {
-        return err(String(e));
-      }
+      } catch (e) { return err(String(e)); }
     }
   );
 
   server.registerTool(
     "supliful_find_customer",
     {
-      description: "Find a Shopify customer by email or phone.",
+      description: "Find a customer by email, phone, or name across a store.",
       inputSchema: {
-        query: z.string().describe("Search query e.g. 'email:user@example.com' or 'phone:+1555...'"),
+        store: storeSchema(),
+        query: z.string().describe("e.g. 'email:user@example.com' or 'phone:+15555' or 'John Smith'"),
+        first: z.number().optional().default(5),
       },
     },
-    async ({ query }) => {
-      const gql = `
-        query FindCustomer($query: String!) {
-          customers(first: 5, query: $query) {
-            edges {
-              node {
-                id email firstName lastName phone
-                createdAt updatedAt
-                ordersCount totalSpent
-                tags
+    async ({ store: storeKey, query, first }) => {
+      const store = resolveStore(storeKey);
+      try {
+        const res = await shopifyGql(store, `
+          query FindCustomer($query: String!, $first: Int!) {
+            customers(first: $first, query: $query) {
+              edges {
+                node {
+                  id email firstName lastName phone createdAt updatedAt ordersCount totalSpent tags
+                }
               }
             }
-          }
-        }`;
-      try {
-        const res = await shopifyGql(gql, { query });
+          }`, { query, first });
         if (res.errors) return err(JSON.stringify(res.errors));
         return ok(res.data?.customers);
-      } catch (e: unknown) {
-        return err(String(e));
-      }
+      } catch (e) { return err(String(e)); }
     }
   );
 
@@ -744,45 +944,43 @@ function createMcpServer(): McpServer {
     {
       description: "Get full customer details including order history.",
       inputSchema: {
-        id: z.string().describe("Customer GID e.g. gid://shopify/Customer/12345"),
+        store: storeSchema(),
+        id: z.string().describe("Customer GID"),
       },
     },
-    async ({ id }) => {
-      const gql = `
-        query GetCustomer($id: ID!) {
-          customer(id: $id) {
-            id email firstName lastName phone note
-            createdAt updatedAt
-            defaultAddress { address1 address2 city province country zip }
-            addresses(first: 5) { edges { node { address1 city country zip } } }
-            orders(first: 10, sortKey: CREATED_AT, reverse: true) {
-              edges {
-                node {
-                  id name createdAt displayFulfillmentStatus displayFinancialStatus
-                  totalPriceSet { shopMoney { amount currencyCode } }
+    async ({ store: storeKey, id }) => {
+      const store = resolveStore(storeKey);
+      try {
+        const res = await shopifyGql(store, `
+          query GetCustomer($id: ID!) {
+            customer(id: $id) {
+              id email firstName lastName phone note createdAt updatedAt
+              defaultAddress { address1 address2 city province country zip }
+              addresses(first: 5) { edges { node { address1 city country zip } } }
+              orders(first: 10, sortKey: CREATED_AT, reverse: true) {
+                edges {
+                  node {
+                    id name createdAt displayFulfillmentStatus displayFinancialStatus
+                    totalPriceSet { shopMoney { amount currencyCode } }
+                  }
                 }
               }
+              tags ordersCount totalSpent
             }
-            tags
-            ordersCount totalSpent
-          }
-        }`;
-      try {
-        const res = await shopifyGql(gql, { id });
+          }`, { id });
         if (res.errors) return err(JSON.stringify(res.errors));
         return ok(res.data?.customer);
-      } catch (e: unknown) {
-        return err(String(e));
-      }
+      } catch (e) { return err(String(e)); }
     }
   );
 
   server.registerTool(
     "supliful_update_customer",
     {
-      description: "Update a customer's details in Shopify.",
+      description: "Update customer details.",
       inputSchema: {
-        id: z.string().describe("Customer GID"),
+        store: storeSchema(),
+        id: z.string(),
         firstName: z.string().optional(),
         lastName: z.string().optional(),
         email: z.string().email().optional(),
@@ -791,324 +989,52 @@ function createMcpServer(): McpServer {
         tags: z.array(z.string()).optional(),
       },
     },
-    async ({ id, firstName, lastName, email, phone, note, tags }) => {
-      const gql = `
-        mutation UpdateCustomer($input: CustomerInput!) {
-          customerUpdate(input: $input) {
-            customer { id email firstName lastName phone }
-            userErrors { field message }
-          }
-        }`;
+    async ({ store: storeKey, id, firstName, lastName, email, phone, note, tags }) => {
+      const store = resolveStore(storeKey);
       try {
-        const res = await shopifyGql(gql, {
-          input: { id, firstName, lastName, email, phone, note, tags },
-        });
+        const res = await shopifyGql(store, `
+          mutation UpdateCustomer($input: CustomerInput!) {
+            customerUpdate(input: $input) {
+              customer { id email firstName lastName phone }
+              userErrors { field message }
+            }
+          }`, { input: { id, firstName, lastName, email, phone, note, tags } });
         if (res.errors) return err(JSON.stringify(res.errors));
         return ok(res.data?.customerUpdate);
-      } catch (e: unknown) {
-        return err(String(e));
-      }
-    }
-  );
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // WEBHOOKS
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  server.registerTool(
-    "supliful_list_webhooks",
-    {
-      description: "List all webhook subscriptions configured in Shopify for Supliful order/fulfillment events.",
-      inputSchema: {},
-    },
-    async () => {
-      const gql = `
-        query ListWebhooks {
-          webhookSubscriptions(first: 50) {
-            edges {
-              node {
-                id topic
-                createdAt updatedAt
-                endpoint {
-                  __typename
-                  ... on WebhookHttpEndpoint { callbackUrl }
-                  ... on WebhookEventBridgeEndpoint { arn }
-                  ... on WebhookPubSubEndpoint { pubSubProject pubSubTopic }
-                }
-              }
-            }
-          }
-        }`;
-      try {
-        const res = await shopifyGql(gql);
-        if (res.errors) return err(JSON.stringify(res.errors));
-        return ok(res.data?.webhookSubscriptions);
-      } catch (e: unknown) {
-        return err(String(e));
-      }
+      } catch (e) { return err(String(e)); }
     }
   );
 
   server.registerTool(
-    "supliful_create_webhook",
+    "supliful_list_customers",
     {
-      description:
-        "Create a webhook subscription to receive Supliful/Shopify order and fulfillment events. Common topics: ORDERS_CREATE, ORDERS_UPDATED, ORDERS_FULFILLED, ORDERS_CANCELLED, FULFILLMENTS_CREATE, FULFILLMENTS_UPDATE.",
+      description: "List or search all customers in a store.",
       inputSchema: {
-        topic: z
-          .enum([
-            "ORDERS_CREATE",
-            "ORDERS_UPDATED",
-            "ORDERS_FULFILLED",
-            "ORDERS_CANCELLED",
-            "ORDERS_PARTIALLY_FULFILLED",
-            "FULFILLMENTS_CREATE",
-            "FULFILLMENTS_UPDATE",
-            "PRODUCTS_CREATE",
-            "PRODUCTS_UPDATE",
-            "PRODUCTS_DELETE",
-            "CUSTOMERS_CREATE",
-            "CUSTOMERS_UPDATE",
-            "REFUNDS_CREATE",
-          ])
-          .describe("Webhook topic"),
-        callbackUrl: z.string().url().describe("HTTPS URL to receive webhook payloads"),
+        store: storeSchema(),
+        first: z.number().optional().default(25),
+        after: z.string().optional(),
+        query: z.string().optional().describe("Shopify customer search e.g. 'orders_count:>5' or 'tag:vip'"),
+        sortKey: z.enum(["CREATED_AT", "UPDATED_AT", "ORDERS_COUNT", "TOTAL_SPENT", "NAME", "ID"]).optional().default("CREATED_AT"),
+        reverse: z.boolean().optional().default(true),
       },
     },
-    async ({ topic, callbackUrl }) => {
-      const gql = `
-        mutation CreateWebhook($topic: WebhookSubscriptionTopic!, $webhookSubscription: WebhookSubscriptionInput!) {
-          webhookSubscriptionCreate(topic: $topic, webhookSubscription: $webhookSubscription) {
-            webhookSubscription {
-              id topic
-              endpoint { __typename ... on WebhookHttpEndpoint { callbackUrl } }
-            }
-            userErrors { field message }
-          }
-        }`;
+    async ({ store: storeKey, first, after, query, sortKey, reverse }) => {
+      const store = resolveStore(storeKey);
       try {
-        const res = await shopifyGql(gql, {
-          topic,
-          webhookSubscription: { callbackUrl, format: "JSON" },
-        });
-        if (res.errors) return err(JSON.stringify(res.errors));
-        return ok(res.data?.webhookSubscriptionCreate);
-      } catch (e: unknown) {
-        return err(String(e));
-      }
-    }
-  );
-
-  server.registerTool(
-    "supliful_delete_webhook",
-    {
-      description: "Delete a webhook subscription by its GID.",
-      inputSchema: {
-        id: z.string().describe("Webhook GID e.g. gid://shopify/WebhookSubscription/123"),
-      },
-    },
-    async ({ id }) => {
-      const gql = `
-        mutation DeleteWebhook($id: ID!) {
-          webhookSubscriptionDelete(id: $id) {
-            deletedWebhookSubscriptionId
-            userErrors { field message }
-          }
-        }`;
-      try {
-        const res = await shopifyGql(gql, { id });
-        if (res.errors) return err(JSON.stringify(res.errors));
-        return ok(res.data?.webhookSubscriptionDelete);
-      } catch (e: unknown) {
-        return err(String(e));
-      }
-    }
-  );
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // SHOP INFO & INVENTORY
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  server.registerTool(
-    "supliful_get_shop_info",
-    {
-      description: "Get Shopify store info including connected fulfillment services (confirms Supliful connection).",
-      inputSchema: {},
-    },
-    async () => {
-      const gql = `
-        query ShopInfo {
-          shop {
-            name email primaryDomain { url }
-            plan { displayName partnerDevelopment }
-            currencyCode
-            weightUnit
-            fulfillmentServices {
-              serviceName handle type inventoryManagement trackingSupport
-              location { name id address { address1 city country } }
-            }
-          }
-        }`;
-      try {
-        const res = await shopifyGql(gql);
-        if (res.errors) return err(JSON.stringify(res.errors));
-        return ok(res.data?.shop);
-      } catch (e: unknown) {
-        return err(String(e));
-      }
-    }
-  );
-
-  server.registerTool(
-    "supliful_list_locations",
-    {
-      description: "List all Shopify locations including the Supliful fulfillment location.",
-      inputSchema: {},
-    },
-    async () => {
-      const gql = `
-        query Locations {
-          locations(first: 30) {
-            edges {
-              node {
-                id name isActive isPrimary
-                fulfillmentService { serviceName handle }
-                address { address1 city country }
-              }
-            }
-          }
-        }`;
-      try {
-        const res = await shopifyGql(gql);
-        if (res.errors) return err(JSON.stringify(res.errors));
-        return ok(res.data?.locations);
-      } catch (e: unknown) {
-        return err(String(e));
-      }
-    }
-  );
-
-  server.registerTool(
-    "supliful_check_product_inventory",
-    {
-      description: "Check inventory levels for a specific product across all locations including Supliful.",
-      inputSchema: {
-        productId: z.string().describe("Product GID"),
-      },
-    },
-    async ({ productId }) => {
-      const gql = `
-        query ProductInventory($id: ID!) {
-          product(id: $id) {
-            id title totalInventory
-            variants(first: 20) {
+        const res = await shopifyGql(store, `
+          query ListCustomers($first: Int!, $after: String, $query: String, $sortKey: CustomerSortKeys, $reverse: Boolean) {
+            customers(first: $first, after: $after, query: $query, sortKey: $sortKey, reverse: $reverse) {
               edges {
                 node {
-                  id title sku
-                  inventoryItem {
-                    id tracked
-                    fulfillmentService { serviceName handle }
-                    inventoryLevels(first: 10) {
-                      edges {
-                        node {
-                          id quantities(names: ["available","on_hand","committed","incoming"]) { name quantity }
-                          location { id name }
-                        }
-                      }
-                    }
-                  }
+                  id email firstName lastName phone createdAt ordersCount totalSpent tags
                 }
               }
+              pageInfo { hasNextPage endCursor }
             }
-          }
-        }`;
-      try {
-        const res = await shopifyGql(gql, { id: productId });
+          }`, { first, after, query, sortKey, reverse });
         if (res.errors) return err(JSON.stringify(res.errors));
-        return ok(res.data?.product);
-      } catch (e: unknown) {
-        return err(String(e));
-      }
-    }
-  );
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // ANALYTICS
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  server.registerTool(
-    "supliful_get_sales_summary",
-    {
-      description:
-        "Get a sales summary for a date range. Returns order count, total revenue, and top products.",
-      inputSchema: {
-        startDate: z.string().describe("ISO date e.g. '2024-01-01'"),
-        endDate: z.string().describe("ISO date e.g. '2024-12-31'"),
-        first: z.number().optional().default(100),
-      },
-    },
-    async ({ startDate, endDate, first }) => {
-      const query = `created_at:>=${startDate} created_at:<=${endDate} financial_status:paid`;
-      const gql = `
-        query SalesSummary($query: String!, $first: Int!) {
-          orders(first: $first, query: $query, sortKey: CREATED_AT) {
-            edges {
-              node {
-                id name createdAt
-                totalPriceSet { shopMoney { amount currencyCode } }
-                displayFulfillmentStatus
-                lineItems(first: 10) {
-                  edges { node { title quantity sku originalUnitPriceSet { shopMoney { amount currencyCode } } } }
-                }
-              }
-            }
-            pageInfo { hasNextPage endCursor }
-          }
-        }`;
-      try {
-        const res = await shopifyGql(gql, { query, first });
-        if (res.errors) return err(JSON.stringify(res.errors));
-        const orders = (res.data?.orders as { edges: { node: { totalPriceSet: { shopMoney: { amount: string; currencyCode: string } } } }[] })?.edges || [];
-        const total = orders.reduce(
-          (sum: number, e) => sum + parseFloat(e.node.totalPriceSet.shopMoney.amount),
-          0
-        );
-        return ok({
-          period: { startDate, endDate },
-          orderCount: orders.length,
-          totalRevenue: `${total.toFixed(2)} ${orders[0]?.node.totalPriceSet.shopMoney.currencyCode ?? "USD"}`,
-          orders: res.data?.orders,
-        });
-      } catch (e: unknown) {
-        return err(String(e));
-      }
-    }
-  );
-
-  server.registerTool(
-    "supliful_get_fulfillment_metrics",
-    {
-      description: "Get fulfillment metrics: how many orders are fulfilled vs pending vs cancelled.",
-      inputSchema: {
-        startDate: z.string().describe("ISO date"),
-        endDate: z.string().describe("ISO date"),
-      },
-    },
-    async ({ startDate, endDate }) => {
-      const baseQuery = `created_at:>=${startDate} created_at:<=${endDate} financial_status:paid`;
-      const statuses = ["fulfilled", "unfulfilled", "partial", "restocked"];
-      const results: Record<string, number> = {};
-      for (const status of statuses) {
-        const q = `${baseQuery} fulfillment_status:${status}`;
-        const gql = `query Count($query: String!) { orders(first: 1, query: $query) { edges { node { id } } pageInfo { hasNextPage } } }`;
-        try {
-          const res = await shopifyGql(gql, { query: q });
-          results[status] = (res.data?.orders as { edges: unknown[] })?.edges?.length ?? 0;
-        } catch {
-          results[status] = -1;
-        }
-      }
-      return ok({ period: { startDate, endDate }, fulfillmentBreakdown: results });
+        return ok({ store: store.name, ...res.data?.customers as object });
+      } catch (e) { return err(String(e)); }
     }
   );
 
@@ -1121,37 +1047,78 @@ function createMcpServer(): McpServer {
     {
       description: "List refunds for a specific order.",
       inputSchema: {
-        orderId: z.string().describe("Order GID"),
+        store: storeSchema(),
+        orderId: z.string(),
       },
     },
-    async ({ orderId }) => {
-      const gql = `
-        query GetRefunds($id: ID!) {
-          order(id: $id) {
-            id name
-            refunds(first: 20) {
-              edges {
-                node {
-                  id createdAt note
-                  totalRefundedSet { shopMoney { amount currencyCode } }
-                  refundLineItems(first: 10) {
-                    edges { node { quantity lineItem { title sku } restockType } }
-                  }
-                  transactions(first: 5) {
-                    edges { node { id kind status amountSet { shopMoney { amount currencyCode } } } }
+    async ({ store: storeKey, orderId }) => {
+      const store = resolveStore(storeKey);
+      try {
+        const res = await shopifyGql(store, `
+          query GetRefunds($id: ID!) {
+            order(id: $id) {
+              id name
+              refunds(first: 20) {
+                edges {
+                  node {
+                    id createdAt note
+                    totalRefundedSet { shopMoney { amount currencyCode } }
+                    refundLineItems(first: 10) {
+                      edges { node { quantity lineItem { title sku } restockType } }
+                    }
+                    transactions(first: 5) {
+                      edges { node { id kind status amountSet { shopMoney { amount currencyCode } } } }
+                    }
                   }
                 }
               }
             }
-          }
-        }`;
-      try {
-        const res = await shopifyGql(gql, { id: orderId });
+          }`, { id: orderId });
         if (res.errors) return err(JSON.stringify(res.errors));
         return ok(res.data?.order);
-      } catch (e: unknown) {
-        return err(String(e));
-      }
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
+  server.registerTool(
+    "supliful_create_refund",
+    {
+      description: "Issue a refund on an order. Use for damaged/wrong products from Supliful.",
+      inputSchema: {
+        store: storeSchema(),
+        orderId: z.string(),
+        note: z.string().optional().describe("Reason for refund"),
+        refundLineItems: z.array(z.object({
+          lineItemId: z.string(),
+          quantity: z.number().int().min(1),
+          restockType: z.enum(["NO_RESTOCK", "CANCEL", "RETURN", "LEGACY_RESTOCK"]).optional().default("NO_RESTOCK"),
+        })).optional(),
+        transactions: z.array(z.object({
+          orderId: z.string(),
+          amount: z.string(),
+          kind: z.enum(["REFUND", "SUGGESTED_REFUND"]).optional().default("REFUND"),
+          gateway: z.string().optional(),
+        })).optional(),
+        notify: z.boolean().optional().default(false),
+      },
+    },
+    async ({ store: storeKey, orderId, note, refundLineItems, transactions, notify }) => {
+      const store = resolveStore(storeKey);
+      try {
+        const res = await shopifyGql(store, `
+          mutation CreateRefund($input: RefundInput!) {
+            refundCreate(input: $input) {
+              refund {
+                id createdAt note
+                totalRefundedSet { shopMoney { amount currencyCode } }
+                refundLineItems(first: 10) { edges { node { quantity lineItem { title } } } }
+              }
+              userErrors { field message }
+            }
+          }`, { input: { orderId, note, refundLineItems, transactions, notify } });
+        if (res.errors) return err(JSON.stringify(res.errors));
+        return ok(res.data?.refundCreate);
+      } catch (e) { return err(String(e)); }
     }
   );
 
@@ -1162,132 +1129,579 @@ function createMcpServer(): McpServer {
   server.registerTool(
     "supliful_create_draft_order",
     {
-      description:
-        "Create a draft order for review before completing. Useful for manual orders with custom pricing or discounts.",
+      description: "Create a draft order for manual review before completing.",
       inputSchema: {
-        lineItems: z.array(
-          z.object({
-            variantId: z.string(),
-            quantity: z.number().int().min(1),
-            appliedDiscount: z
-              .object({
-                description: z.string().optional(),
-                value: z.number(),
-                valueType: z.enum(["PERCENTAGE", "FIXED_AMOUNT"]),
-              })
-              .optional(),
-          })
-        ),
+        store: storeSchema(),
+        lineItems: z.array(z.object({
+          variantId: z.string(),
+          quantity: z.number().int().min(1),
+          appliedDiscount: z.object({
+            description: z.string().optional(),
+            value: z.number(),
+            valueType: z.enum(["PERCENTAGE", "FIXED_AMOUNT"]),
+          }).optional(),
+        })),
         email: z.string().email(),
         phone: z.string().optional(),
         shippingAddress: z.object({
-          firstName: z.string(),
-          lastName: z.string(),
-          address1: z.string(),
-          city: z.string(),
-          countryCode: z.string(),
-          zip: z.string(),
+          firstName: z.string(), lastName: z.string(),
+          address1: z.string(), city: z.string(),
+          countryCode: z.string(), zip: z.string(),
           phone: z.string().optional(),
         }),
         note: z.string().optional(),
         tags: z.array(z.string()).optional(),
+        customAttributes: z.array(z.object({ key: z.string(), value: z.string() })).optional(),
       },
     },
-    async ({ lineItems, email, phone, shippingAddress, note, tags }) => {
-      const gql = `
-        mutation CreateDraftOrder($input: DraftOrderInput!) {
-          draftOrderCreate(input: $input) {
-            draftOrder {
-              id name status
-              invoiceUrl
-              totalPriceSet { shopMoney { amount currencyCode } }
-            }
-            userErrors { field message }
-          }
-        }`;
+    async ({ store: storeKey, lineItems, email, phone, shippingAddress, note, tags, customAttributes }) => {
+      const store = resolveStore(storeKey);
       try {
-        const res = await shopifyGql(gql, {
-          input: { lineItems, email, phone, shippingAddress, note, tags },
-        });
+        const res = await shopifyGql(store, `
+          mutation CreateDraftOrder($input: DraftOrderInput!) {
+            draftOrderCreate(input: $input) {
+              draftOrder {
+                id name status invoiceUrl
+                totalPriceSet { shopMoney { amount currencyCode } }
+              }
+              userErrors { field message }
+            }
+          }`, { input: { lineItems, email, phone, shippingAddress, note, tags, customAttributes } });
         if (res.errors) return err(JSON.stringify(res.errors));
         return ok(res.data?.draftOrderCreate);
-      } catch (e: unknown) {
-        return err(String(e));
-      }
+      } catch (e) { return err(String(e)); }
     }
   );
 
   server.registerTool(
     "supliful_complete_draft_order",
     {
-      description: "Complete a draft order to convert it into a real Shopify order for Supliful fulfillment.",
+      description: "Complete a draft order to create a real Shopify order for Supliful.",
       inputSchema: {
-        draftOrderId: z.string().describe("Draft order GID e.g. gid://shopify/DraftOrder/123"),
+        store: storeSchema(),
+        draftOrderId: z.string(),
         paymentPending: z.boolean().optional().default(false),
       },
     },
-    async ({ draftOrderId, paymentPending }) => {
-      const gql = `
-        mutation CompleteDraftOrder($id: ID!, $paymentPending: Boolean!) {
-          draftOrderComplete(id: $id, paymentPending: $paymentPending) {
-            draftOrder {
-              id status
-              order { id name displayFinancialStatus displayFulfillmentStatus }
-            }
-            userErrors { field message }
-          }
-        }`;
+    async ({ store: storeKey, draftOrderId, paymentPending }) => {
+      const store = resolveStore(storeKey);
       try {
-        const res = await shopifyGql(gql, { id: draftOrderId, paymentPending });
+        const res = await shopifyGql(store, `
+          mutation CompleteDraftOrder($id: ID!, $paymentPending: Boolean!) {
+            draftOrderComplete(id: $id, paymentPending: $paymentPending) {
+              draftOrder {
+                id status
+                order { id name displayFinancialStatus displayFulfillmentStatus }
+              }
+              userErrors { field message }
+            }
+          }`, { id: draftOrderId, paymentPending });
         if (res.errors) return err(JSON.stringify(res.errors));
         return ok(res.data?.draftOrderComplete);
-      } catch (e: unknown) {
-        return err(String(e));
-      }
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
+  server.registerTool(
+    "supliful_list_draft_orders",
+    {
+      description: "List draft orders in a store.",
+      inputSchema: {
+        store: storeSchema(),
+        first: z.number().optional().default(25),
+        after: z.string().optional(),
+        query: z.string().optional(),
+      },
+    },
+    async ({ store: storeKey, first, after, query }) => {
+      const store = resolveStore(storeKey);
+      try {
+        const res = await shopifyGql(store, `
+          query ListDraftOrders($first: Int!, $after: String, $query: String) {
+            draftOrders(first: $first, after: $after, query: $query, sortKey: UPDATED_AT, reverse: true) {
+              edges {
+                node {
+                  id name status email createdAt updatedAt
+                  invoiceUrl
+                  totalPriceSet { shopMoney { amount currencyCode } }
+                  lineItems(first: 5) { edges { node { title quantity } } }
+                }
+              }
+              pageInfo { hasNextPage endCursor }
+            }
+          }`, { first, after, query });
+        if (res.errors) return err(JSON.stringify(res.errors));
+        return ok({ store: store.name, ...res.data?.draftOrders as object });
+      } catch (e) { return err(String(e)); }
     }
   );
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // HEALTH CHECK
+  // WEBHOOKS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  server.registerTool(
+    "supliful_list_webhooks",
+    {
+      description: "List all webhook subscriptions in a store.",
+      inputSchema: { store: storeSchema() },
+    },
+    async ({ store: storeKey }) => {
+      const store = resolveStore(storeKey);
+      try {
+        const res = await shopifyGql(store, `
+          query ListWebhooks {
+            webhookSubscriptions(first: 50) {
+              edges {
+                node {
+                  id topic createdAt updatedAt
+                  endpoint {
+                    __typename
+                    ... on WebhookHttpEndpoint { callbackUrl }
+                    ... on WebhookEventBridgeEndpoint { arn }
+                    ... on WebhookPubSubEndpoint { pubSubProject pubSubTopic }
+                  }
+                }
+              }
+            }
+          }`);
+        if (res.errors) return err(JSON.stringify(res.errors));
+        return ok({ store: store.name, ...res.data?.webhookSubscriptions as object });
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
+  server.registerTool(
+    "supliful_create_webhook",
+    {
+      description: "Create a webhook for order/fulfillment events.",
+      inputSchema: {
+        store: storeSchema(),
+        topic: z.enum([
+          "ORDERS_CREATE", "ORDERS_UPDATED", "ORDERS_FULFILLED", "ORDERS_CANCELLED", "ORDERS_PARTIALLY_FULFILLED",
+          "FULFILLMENTS_CREATE", "FULFILLMENTS_UPDATE",
+          "PRODUCTS_CREATE", "PRODUCTS_UPDATE", "PRODUCTS_DELETE",
+          "CUSTOMERS_CREATE", "CUSTOMERS_UPDATE", "CUSTOMERS_DELETE",
+          "REFUNDS_CREATE", "DRAFT_ORDERS_CREATE", "DRAFT_ORDERS_UPDATE",
+        ]),
+        callbackUrl: z.string().url(),
+      },
+    },
+    async ({ store: storeKey, topic, callbackUrl }) => {
+      const store = resolveStore(storeKey);
+      try {
+        const res = await shopifyGql(store, `
+          mutation CreateWebhook($topic: WebhookSubscriptionTopic!, $webhookSubscription: WebhookSubscriptionInput!) {
+            webhookSubscriptionCreate(topic: $topic, webhookSubscription: $webhookSubscription) {
+              webhookSubscription {
+                id topic
+                endpoint { __typename ... on WebhookHttpEndpoint { callbackUrl } }
+              }
+              userErrors { field message }
+            }
+          }`, { topic, webhookSubscription: { callbackUrl, format: "JSON" } });
+        if (res.errors) return err(JSON.stringify(res.errors));
+        return ok(res.data?.webhookSubscriptionCreate);
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
+  server.registerTool(
+    "supliful_delete_webhook",
+    {
+      description: "Delete a webhook subscription.",
+      inputSchema: { store: storeSchema(), id: z.string().describe("Webhook GID") },
+    },
+    async ({ store: storeKey, id }) => {
+      const store = resolveStore(storeKey);
+      try {
+        const res = await shopifyGql(store, `
+          mutation DeleteWebhook($id: ID!) {
+            webhookSubscriptionDelete(id: $id) {
+              deletedWebhookSubscriptionId
+              userErrors { field message }
+            }
+          }`, { id });
+        if (res.errors) return err(JSON.stringify(res.errors));
+        return ok(res.data?.webhookSubscriptionDelete);
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SHOP INFO & INVENTORY
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  server.registerTool(
+    "supliful_get_shop_info",
+    {
+      description: "Get store info and confirm Supliful fulfillment service is connected.",
+      inputSchema: { store: storeSchema() },
+    },
+    async ({ store: storeKey }) => {
+      const store = resolveStore(storeKey);
+      try {
+        const res = await shopifyGql(store, `
+          query ShopInfo {
+            shop {
+              name email primaryDomain { url }
+              plan { displayName partnerDevelopment }
+              currencyCode weightUnit
+              fulfillmentServices {
+                serviceName handle type inventoryManagement trackingSupport
+                location { name id address { address1 city country } }
+              }
+            }
+          }`);
+        if (res.errors) return err(JSON.stringify(res.errors));
+        return ok(res.data?.shop);
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
+  server.registerTool(
+    "supliful_list_locations",
+    {
+      description: "List all fulfillment locations including Supliful.",
+      inputSchema: { store: storeSchema() },
+    },
+    async ({ store: storeKey }) => {
+      const store = resolveStore(storeKey);
+      try {
+        const res = await shopifyGql(store, `
+          query Locations {
+            locations(first: 30) {
+              edges {
+                node {
+                  id name isActive isPrimary
+                  fulfillmentService { serviceName handle }
+                  address { address1 city country }
+                }
+              }
+            }
+          }`);
+        if (res.errors) return err(JSON.stringify(res.errors));
+        return ok(res.data?.locations);
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
+  server.registerTool(
+    "supliful_check_product_inventory",
+    {
+      description: "Check inventory levels for a product across all locations.",
+      inputSchema: {
+        store: storeSchema(),
+        productId: z.string(),
+      },
+    },
+    async ({ store: storeKey, productId }) => {
+      const store = resolveStore(storeKey);
+      try {
+        const res = await shopifyGql(store, `
+          query ProductInventory($id: ID!) {
+            product(id: $id) {
+              id title totalInventory
+              variants(first: 20) {
+                edges {
+                  node {
+                    id title sku
+                    inventoryItem {
+                      id tracked
+                      fulfillmentService { serviceName handle }
+                      inventoryLevels(first: 10) {
+                        edges {
+                          node {
+                            id
+                            quantities(names: ["available","on_hand","committed","incoming"]) { name quantity }
+                            location { id name }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }`, { id: productId });
+        if (res.errors) return err(JSON.stringify(res.errors));
+        return ok(res.data?.product);
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ANALYTICS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  server.registerTool(
+    "supliful_get_sales_summary",
+    {
+      description: "Get sales summary (revenue, order count, top products) for a date range.",
+      inputSchema: {
+        store: storeSchema(),
+        startDate: z.string(),
+        endDate: z.string(),
+        first: z.number().optional().default(100),
+      },
+    },
+    async ({ store: storeKey, startDate, endDate, first }) => {
+      const store = resolveStore(storeKey);
+      const query = `created_at:>=${startDate} created_at:<=${endDate} financial_status:paid`;
+      try {
+        const res = await shopifyGql(store, `
+          query SalesSummary($query: String!, $first: Int!) {
+            orders(first: $first, query: $query, sortKey: CREATED_AT) {
+              edges {
+                node {
+                  id name createdAt displayFulfillmentStatus
+                  totalPriceSet { shopMoney { amount currencyCode } }
+                  lineItems(first: 10) {
+                    edges { node { title quantity sku originalUnitPriceSet { shopMoney { amount currencyCode } } } }
+                  }
+                }
+              }
+              pageInfo { hasNextPage endCursor }
+            }
+          }`, { query, first });
+        if (res.errors) return err(JSON.stringify(res.errors));
+        const orders = (res.data?.orders as { edges: { node: { totalPriceSet: { shopMoney: { amount: string; currencyCode: string } } } }[] })?.edges || [];
+        const total = orders.reduce((s, e) => s + parseFloat(e.node.totalPriceSet.shopMoney.amount), 0);
+        return ok({
+          store: store.name, period: { startDate, endDate },
+          orderCount: orders.length,
+          totalRevenue: `${total.toFixed(2)} ${orders[0]?.node.totalPriceSet.shopMoney.currencyCode ?? "USD"}`,
+          hasMore: (res.data?.orders as { pageInfo: { hasNextPage: boolean } })?.pageInfo?.hasNextPage,
+          orders: res.data?.orders,
+        });
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
+  server.registerTool(
+    "supliful_get_fulfillment_metrics",
+    {
+      description: "Get fulfillment breakdown (fulfilled/unfulfilled/partial) for a date range.",
+      inputSchema: {
+        store: storeSchema(),
+        startDate: z.string(),
+        endDate: z.string(),
+      },
+    },
+    async ({ store: storeKey, startDate, endDate }) => {
+      const store = resolveStore(storeKey);
+      const base = `created_at:>=${startDate} created_at:<=${endDate} financial_status:paid`;
+      const results: Record<string, number> = {};
+      for (const status of ["fulfilled", "unfulfilled", "partial", "restocked"]) {
+        try {
+          const res = await shopifyGql(store,
+            `query Count($query: String!) { orders(first: 250, query: $query) { edges { node { id } } } }`,
+            { query: `${base} fulfillment_status:${status}` });
+          results[status] = (res.data?.orders as { edges: unknown[] })?.edges?.length ?? 0;
+        } catch { results[status] = -1; }
+      }
+      return ok({ store: store.name, period: { startDate, endDate }, fulfillmentBreakdown: results });
+    }
+  );
+
+  server.registerTool(
+    "supliful_get_top_products",
+    {
+      description: "Get top selling products by order count for a date range.",
+      inputSchema: {
+        store: storeSchema(),
+        startDate: z.string(),
+        endDate: z.string(),
+        first: z.number().optional().default(100),
+      },
+    },
+    async ({ store: storeKey, startDate, endDate, first }) => {
+      const store = resolveStore(storeKey);
+      const query = `created_at:>=${startDate} created_at:<=${endDate} financial_status:paid`;
+      try {
+        const res = await shopifyGql(store, `
+          query TopProducts($query: String!, $first: Int!) {
+            orders(first: $first, query: $query) {
+              edges {
+                node {
+                  lineItems(first: 20) {
+                    edges { node { title quantity sku originalUnitPriceSet { shopMoney { amount currencyCode } } } }
+                  }
+                }
+              }
+            }
+          }`, { query, first });
+        if (res.errors) return err(JSON.stringify(res.errors));
+        // Aggregate
+        const productMap: Record<string, { title: string; sku: string; quantity: number; revenue: number; currency: string }> = {};
+        for (const { node: order } of (res.data?.orders as { edges: { node: { lineItems: { edges: { node: { title: string; quantity: number; sku: string; originalUnitPriceSet: { shopMoney: { amount: string; currencyCode: string } } } }[] } } }[] })?.edges || []) {
+          for (const { node: item } of order.lineItems.edges) {
+            const key = item.sku || item.title;
+            if (!productMap[key]) productMap[key] = { title: item.title, sku: item.sku, quantity: 0, revenue: 0, currency: item.originalUnitPriceSet.shopMoney.currencyCode };
+            productMap[key].quantity += item.quantity;
+            productMap[key].revenue += parseFloat(item.originalUnitPriceSet.shopMoney.amount) * item.quantity;
+          }
+        }
+        const sorted = Object.values(productMap).sort((a, b) => b.quantity - a.quantity).slice(0, 20);
+        return ok({ store: store.name, period: { startDate, endDate }, topProducts: sorted });
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
+  server.registerTool(
+    "supliful_get_orders_by_country",
+    {
+      description: "Break down orders by destination country for a date range.",
+      inputSchema: {
+        store: storeSchema(),
+        startDate: z.string(),
+        endDate: z.string(),
+        first: z.number().optional().default(250),
+      },
+    },
+    async ({ store: storeKey, startDate, endDate, first }) => {
+      const store = resolveStore(storeKey);
+      try {
+        const res = await shopifyGql(store, `
+          query OrdersByCountry($query: String!, $first: Int!) {
+            orders(first: $first, query: $query) {
+              edges {
+                node {
+                  shippingAddress { country countryCode }
+                  totalPriceSet { shopMoney { amount currencyCode } }
+                }
+              }
+            }
+          }`, { query: `created_at:>=${startDate} created_at:<=${endDate} financial_status:paid`, first });
+        if (res.errors) return err(JSON.stringify(res.errors));
+        const countryMap: Record<string, { count: number; revenue: number }> = {};
+        for (const { node } of (res.data?.orders as { edges: { node: { shippingAddress: { country: string }; totalPriceSet: { shopMoney: { amount: string } } } }[] })?.edges || []) {
+          const c = node.shippingAddress?.country || "Unknown";
+          if (!countryMap[c]) countryMap[c] = { count: 0, revenue: 0 };
+          countryMap[c].count++;
+          countryMap[c].revenue += parseFloat(node.totalPriceSet.shopMoney.amount);
+        }
+        const sorted = Object.entries(countryMap).sort((a, b) => b[1].count - a[1].count);
+        return ok({ store: store.name, period: { startDate, endDate }, byCountry: Object.fromEntries(sorted) });
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // DISCOUNTS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  server.registerTool(
+    "supliful_list_discount_codes",
+    {
+      description: "List discount codes in a Shopify store.",
+      inputSchema: {
+        store: storeSchema(),
+        first: z.number().optional().default(20),
+        query: z.string().optional().describe("Search by code e.g. 'SUMMER20'"),
+      },
+    },
+    async ({ store: storeKey, first, query }) => {
+      const store = resolveStore(storeKey);
+      try {
+        const res = await shopifyGql(store, `
+          query ListDiscounts($first: Int!, $query: String) {
+            codeDiscountNodes(first: $first, query: $query, sortKey: UPDATED_AT, reverse: true) {
+              edges {
+                node {
+                  id
+                  codeDiscount {
+                    ... on DiscountCodeBasic {
+                      title status
+                      codes(first: 5) { edges { node { code asyncUsageCount } } }
+                      customerGets {
+                        value {
+                          ... on DiscountPercentage { percentage }
+                          ... on DiscountAmount { amount { amount currencyCode } }
+                        }
+                      }
+                      startsAt endsAt
+                      usageLimit
+                    }
+                    ... on DiscountCodeFreeShipping {
+                      title status
+                      codes(first: 5) { edges { node { code asyncUsageCount } } }
+                      startsAt endsAt usageLimit
+                    }
+                  }
+                }
+              }
+              pageInfo { hasNextPage }
+            }
+          }`, { first, query });
+        if (res.errors) return err(JSON.stringify(res.errors));
+        return ok({ store: store.name, ...res.data?.codeDiscountNodes as object });
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // HEALTH & DIAGNOSTICS
   // ═══════════════════════════════════════════════════════════════════════════
 
   server.registerTool(
     "supliful_health_check",
     {
-      description:
-        "Verify that the Supliful MCP server can connect to Shopify and that the Supliful fulfillment service is active.",
-      inputSchema: {},
+      description: "Verify connection to all stores and confirm Supliful fulfillment is active.",
+      inputSchema: {
+        store: z.string().optional().describe("Check a specific store, or omit to check ALL stores"),
+      },
     },
-    async () => {
-      try {
-        const gql = `
-          query HealthCheck {
-            shop {
-              name email
-              fulfillmentServices {
-                serviceName handle type inventoryManagement
+    async ({ store: storeKey }) => {
+      const targets = storeKey ? [resolveStore(storeKey)] : STORES;
+      const results: Record<string, unknown> = {};
+      for (const store of targets) {
+        try {
+          const res = await shopifyGql(store, `
+            query HealthCheck {
+              shop {
+                name email
+                fulfillmentServices { serviceName handle type inventoryManagement }
               }
-            }
-          }`;
-        const res = await shopifyGql(gql);
-        if (res.errors) return err(JSON.stringify(res.errors));
-        const shop = res.data?.shop as { name: string; email: string; fulfillmentServices: { serviceName: string; handle: string }[] };
-        const suplifulConnected = shop?.fulfillmentServices?.some(
-          (f) =>
-            f.serviceName?.toLowerCase().includes("supliful") ||
-            f.handle?.toLowerCase().includes("supliful")
-        );
-        return ok({
-          status: "ok",
-          shopName: shop?.name,
-          shopEmail: shop?.email,
-          suplifulConnected,
-          fulfillmentServices: shop?.fulfillmentServices,
-          shopifyApiVersion: SHOPIFY_API_VERSION,
-        });
-      } catch (e: unknown) {
-        return err(`Connection failed: ${String(e)}`);
+            }`);
+          if (res.errors) { results[store.name] = { status: "error", errors: res.errors }; continue; }
+          const shop = res.data?.shop as { name: string; email: string; fulfillmentServices: { serviceName: string; handle: string }[] };
+          const suplifulConnected = shop?.fulfillmentServices?.some(
+            (f) => f.serviceName?.toLowerCase().includes("supliful") || f.handle?.toLowerCase().includes("supliful")
+          );
+          results[store.name] = {
+            status: "ok", domain: store.domain,
+            shopName: shop?.name, shopEmail: shop?.email,
+            suplifulConnected, fulfillmentServices: shop?.fulfillmentServices,
+          };
+        } catch (e) {
+          results[store.name] = { status: "error", error: String(e) };
+        }
       }
+      return ok({ shopifyApiVersion: SHOPIFY_API_VERSION, stores: results });
+    }
+  );
+
+  server.registerTool(
+    "supliful_get_api_rate_limit",
+    {
+      description: "Check remaining Shopify API rate limit quota for a store.",
+      inputSchema: { store: storeSchema() },
+    },
+    async ({ store: storeKey }) => {
+      const store = resolveStore(storeKey);
+      try {
+        const url = `https://${store.domain}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": store.token },
+          body: JSON.stringify({ query: "{ shop { name } }" }),
+        });
+        const remaining = res.headers.get("X-Shopify-Shop-Api-Call-Limit");
+        const retryAfter = res.headers.get("Retry-After");
+        const data = await res.json() as Record<string, unknown>;
+        return ok({ store: store.name, rateLimitHeader: remaining, retryAfter, extensions: data.extensions });
+      } catch (e) { return err(String(e)); }
     }
   );
 
@@ -1302,17 +1716,17 @@ const httpServer = http.createServer((req, res) => {
 
   if (req.method === "GET" && url.pathname === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", service: "supliful-mcp", store: SHOPIFY_STORE }));
+    res.end(JSON.stringify({
+      status: "ok", service: "supliful-mcp", version: "2.0.0",
+      stores: STORES.map((s) => ({ key: s.key, name: s.name, domain: s.domain })),
+    }));
     return;
   }
 
   if (req.method === "GET" && url.pathname === "/sse") {
     const transport = new SSEServerTransport("/messages", res);
-    const sessionId = transport.sessionId;
-    sessions.set(sessionId, transport);
-
-    res.on("close", () => sessions.delete(sessionId));
-
+    sessions.set(transport.sessionId, transport);
+    res.on("close", () => sessions.delete(transport.sessionId));
     const server = createMcpServer();
     server.connect(transport).catch((e: Error) => console.error("Connect error:", e));
     return;
@@ -1320,23 +1734,12 @@ const httpServer = http.createServer((req, res) => {
 
   if (req.method === "POST" && url.pathname === "/messages") {
     const sessionId = url.searchParams.get("sessionId");
-    if (!sessionId) {
-      res.writeHead(400);
-      res.end("Missing sessionId");
-      return;
-    }
+    if (!sessionId) { res.writeHead(400); res.end("Missing sessionId"); return; }
     const transport = sessions.get(sessionId);
-    if (!transport) {
-      res.writeHead(404);
-      res.end("Session not found");
-      return;
-    }
-
+    if (!transport) { res.writeHead(404); res.end("Session not found"); return; }
     let body = "";
     req.on("data", (chunk) => (body += chunk));
-    req.on("end", () => {
-      transport.handlePostMessage(req, res, body ? JSON.parse(body) : undefined);
-    });
+    req.on("end", () => { transport.handlePostMessage(req, res, body ? JSON.parse(body) : undefined); });
     return;
   }
 
@@ -1345,7 +1748,7 @@ const httpServer = http.createServer((req, res) => {
 });
 
 httpServer.listen(PORT, () => {
-  console.log(`Supliful MCP Server running on port ${PORT}`);
-  console.log(`Store: ${SHOPIFY_STORE} | API: ${SHOPIFY_API_VERSION}`);
+  console.log(`Supliful MCP Server v2.0 running on port ${PORT}`);
+  console.log(`Stores: ${STORES.map((s) => `${s.name} (${s.domain})`).join(" | ")}`);
   console.log(`SSE: http://localhost:${PORT}/sse`);
 });
