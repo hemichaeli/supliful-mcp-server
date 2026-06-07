@@ -88,6 +88,54 @@ function storeSchema() {
     );
 }
 
+// ─── Supliful publish guard ──────────────────────────────────────────────────
+// HARD RULE: a product may be set ACTIVE only if EVERY variant has a Supliful SKU
+// AND its inventory is stocked at the "Supliful Fulfillment" location.
+async function assertSuplifulReady(
+  store: StoreConfig,
+  productId: string,
+): Promise<{ ok: true } | { ok: false; message: string }> {
+  let res;
+  try {
+    res = await shopifyGql(
+      store,
+      `query($id: ID!) {
+        product(id: $id) {
+          title
+          variants(first: 100) {
+            edges { node { sku inventoryItem { inventoryLevels(first: 10) { edges { node { location { name } } } } } } }
+          }
+        }
+      }`,
+      { id: productId },
+    );
+  } catch (e) {
+    return { ok: false, message: `Could not verify Supliful readiness: ${String(e)}` };
+  }
+  const p = (res.data as any)?.product;
+  if (!p) return { ok: false, message: `Product ${productId} not found on ${store.name}.` };
+  const variants = (p.variants?.edges || []).map((e: any) => e.node);
+  const isSupliful = (n: string) => /supliful/i.test(n || "");
+  const compliant =
+    variants.length > 0 &&
+    variants.every((v: any) => {
+      const locs = (v.inventoryItem?.inventoryLevels?.edges || []).map((x: any) => x.node.location.name);
+      return v.sku && locs.length > 0 && locs.every(isSupliful);
+    });
+  if (compliant) return { ok: true };
+  return {
+    ok: false,
+    message:
+      `🛑 BLOCKED — cannot publish "${p.title}" on ${store.name}: it is NOT connected to Supliful.\n\n` +
+      `Hard rule: a product may be set ACTIVE only if EVERY variant has a Supliful SKU AND its ` +
+      `inventory is stocked at the "Supliful Fulfillment" location.\n\n` +
+      `Fix: connect the product through the Supliful app first (assigns the SKU and stocks it at ` +
+      `Supliful Fulfillment), then publish. Until then it stays DRAFT.\n\n` +
+      `Why: a product not stocked at Supliful routes to the merchant-managed location, gets marked ` +
+      `FULFILLED with requestStatus=UNSUBMITTED, never ships, and is refunded (proven on #1001 & #1002).`,
+  };
+}
+
 // ─── Server factory ──────────────────────────────────────────────────────────
 function createMcpServer(): McpServer {
   const server = new McpServer({ name: "supliful-mcp", version: "2.0.0" });
@@ -372,6 +420,10 @@ function createMcpServer(): McpServer {
     },
     async ({ store: storeKey, id, title, descriptionHtml, tags, status, seoTitle, seoDescription }) => {
       const store = resolveStore(storeKey);
+      if (status === "ACTIVE") {
+        const guard = await assertSuplifulReady(store, id);
+        if (!guard.ok) return err(guard.message);
+      }
       const input: Record<string, unknown> = { id };
       if (title !== undefined) input.title = title;
       if (descriptionHtml !== undefined) input.descriptionHtml = descriptionHtml;
