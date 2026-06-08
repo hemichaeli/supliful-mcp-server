@@ -6,6 +6,18 @@
   local-Chrome/CDP MCP isn't reachable from the current environment, say so instead of using a
   different browser.
 
+## Publish guards (hard rules, enforced in `supliful_update_product` on status=ACTIVE)
+- **Selling stores (MAXima, MAXimo):** a product may go ACTIVE only if EVERY variant has a
+  Supliful SKU AND its inventory is stocked at "Supliful Fulfillment" (`assertSuplifulReady`).
+  Otherwise refuse and return a clear 🛑 BLOCKED error; product stays DRAFT.
+- **Gateway store (GenoMAX Gateway):** non-selling. ANY product→ACTIVE is refused outright
+  (`assertSellableStore`, matches `/gateway/i` on store name). Stays DRAFT.
+- Both blocks also `console.error` a `[GUARD] ...` line for server-side logging.
+- Second, complementary enforcement layer: a separate `supliful-publish-guard` webhook server
+  (repo `hemichaeli/supliful-publish-guard`, its own Railway service) catches publishes from ANY
+  source via Shopify webhooks and reverts violators to DRAFT. Currently guards MAXima + MAXimo only
+  (NOT GenoMAX Gateway), and only logs — no prominent alert. Lives outside this repo.
+
 ## Deploy (Railway)
 - Service `supliful-mcp-server` (project `supliful-mcp-server`, env `production`) auto-deploys from
   GitHub `main` — native Railway GitHub integration. This was broken for a while (the "All →
