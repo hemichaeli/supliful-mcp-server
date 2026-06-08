@@ -1783,6 +1783,281 @@ function createMcpServer(): McpServer {
     }
   );
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PARITY TOOLS — general Admin API coverage (match the official Shopify MCP)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // Arbitrary READ access to the Admin GraphQL API (all stores). Mutations are
+  // refused here on purpose so writes can't bypass the publish guards — use the
+  // dedicated guarded tools for writes.
+  server.registerTool(
+    "supliful_graphql_query",
+    {
+      description: "Run an arbitrary READ-ONLY Shopify Admin GraphQL query (any resource). Mutations are rejected — use the dedicated write tools.",
+      inputSchema: {
+        store: storeSchema(),
+        query: z.string().describe("A GraphQL query (read-only). Must not contain a mutation."),
+        variables: z.record(z.any()).optional(),
+      },
+    },
+    async ({ store: storeKey, query, variables }) => {
+      const store = resolveStore(storeKey);
+      if (/\bmutation\b/i.test(query)) {
+        return err("Read-only passthrough: mutations are not allowed here (they could bypass the publish guards). Use a dedicated write tool.");
+      }
+      try {
+        const res = await shopifyGql(store, query, variables || {});
+        if (res.errors) return err(JSON.stringify(res.errors));
+        return ok({ store: store.name, data: res.data });
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
+  // Create a product. Never creates ACTIVE directly: if ACTIVE is requested the
+  // product is created DRAFT and only flipped to ACTIVE if it passes the guards.
+  server.registerTool(
+    "supliful_create_product",
+    {
+      description: "Create a product. If status=ACTIVE is requested, the publish guards apply (gateway store + Supliful readiness); otherwise the product stays DRAFT.",
+      inputSchema: {
+        store: storeSchema(),
+        title: z.string(),
+        descriptionHtml: z.string().optional(),
+        vendor: z.string().optional(),
+        productType: z.string().optional(),
+        tags: z.array(z.string()).optional(),
+        status: z.enum(["ACTIVE", "DRAFT", "ARCHIVED"]).optional().default("DRAFT"),
+        seoTitle: z.string().optional(),
+        seoDescription: z.string().optional(),
+      },
+    },
+    async ({ store: storeKey, title, descriptionHtml, vendor, productType, tags, status, seoTitle, seoDescription }) => {
+      const store = resolveStore(storeKey);
+      const wantsActive = status === "ACTIVE";
+      const input: Record<string, unknown> = { title, status: wantsActive ? "DRAFT" : (status || "DRAFT") };
+      if (descriptionHtml !== undefined) input.descriptionHtml = descriptionHtml;
+      if (vendor !== undefined) input.vendor = vendor;
+      if (productType !== undefined) input.productType = productType;
+      if (tags !== undefined) input.tags = tags;
+      if (seoTitle || seoDescription) input.seo = { title: seoTitle, description: seoDescription };
+      try {
+        const res = await shopifyGql(store, `
+          mutation CreateProduct($input: ProductInput!) {
+            productCreate(input: $input) {
+              product { id title status handle }
+              userErrors { field message }
+            }
+          }`, { input });
+        if (res.errors) return err(JSON.stringify(res.errors));
+        const created = res.data?.productCreate as { product?: { id: string; title: string; status: string }; userErrors?: { field: string; message: string }[] };
+        if (created?.userErrors?.length) return err(JSON.stringify(created.userErrors));
+        const product = created.product!;
+        if (!wantsActive) return ok({ store: store.name, product });
+        // ACTIVE requested: run the publish guards before flipping live.
+        const sellable = assertSellableStore(store);
+        const guard = sellable.ok ? await assertSuplifulReady(store, product.id) : sellable;
+        if (!guard.ok) {
+          console.error(`[GUARD] ${store.name}: refused ACTIVE on create of ${product.id} — kept DRAFT.`);
+          return ok({ store: store.name, product, activationRefused: true, message: guard.message });
+        }
+        const upd = await shopifyGql(store, `
+          mutation Publish($input: ProductInput!) {
+            productUpdate(input: $input) { product { id title status } userErrors { field message } }
+          }`, { input: { id: product.id, status: "ACTIVE" } });
+        if (upd.errors) return err(JSON.stringify(upd.errors));
+        return ok({ store: store.name, ...(upd.data?.productUpdate as object) });
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
+  // Bulk set product status. When the target is ACTIVE, each id is guarded
+  // individually and non-compliant products are blocked (not published).
+  server.registerTool(
+    "supliful_bulk_update_product_status",
+    {
+      description: "Set status on many products at once. For status=ACTIVE the publish guards are applied per product; non-compliant ones are blocked.",
+      inputSchema: {
+        store: storeSchema(),
+        ids: z.array(z.string()).describe("Product GIDs"),
+        status: z.enum(["ACTIVE", "DRAFT", "ARCHIVED"]),
+      },
+    },
+    async ({ store: storeKey, ids, status }) => {
+      const store = resolveStore(storeKey);
+      const results: { id: string; result: string; message?: string }[] = [];
+      for (const id of ids) {
+        if (status === "ACTIVE") {
+          const sellable = assertSellableStore(store);
+          const guard = sellable.ok ? await assertSuplifulReady(store, id) : sellable;
+          if (!guard.ok) {
+            console.error(`[GUARD] ${store.name}: blocked ACTIVE of ${id} (bulk).`);
+            results.push({ id, result: "BLOCKED", message: guard.message });
+            continue;
+          }
+        }
+        try {
+          const res = await shopifyGql(store, `
+            mutation UpdateStatus($input: ProductInput!) {
+              productUpdate(input: $input) { product { id status } userErrors { field message } }
+            }`, { input: { id, status } });
+          const ue = (res.data?.productUpdate as { userErrors?: { message: string }[] })?.userErrors;
+          if (res.errors || ue?.length) results.push({ id, result: "error", message: JSON.stringify(res.errors || ue) });
+          else results.push({ id, result: status });
+        } catch (e) { results.push({ id, result: "error", message: String(e) }); }
+      }
+      return ok({ store: store.name, status, results });
+    }
+  );
+
+  server.registerTool(
+    "supliful_set_inventory",
+    {
+      description: "Set the on-hand/available inventory quantity for an inventory item at a location.",
+      inputSchema: {
+        store: storeSchema(),
+        inventoryItemId: z.string().describe("InventoryItem GID"),
+        locationId: z.string().describe("Location GID"),
+        quantity: z.number().int(),
+        name: z.enum(["available", "on_hand"]).optional().default("available"),
+      },
+    },
+    async ({ store: storeKey, inventoryItemId, locationId, quantity, name }) => {
+      const store = resolveStore(storeKey);
+      try {
+        const cur = await shopifyGql(store, `
+          query($id: ID!, $loc: ID!) {
+            inventoryItem(id: $id) { inventoryLevel(locationId: $loc) { quantities(names: ["${name}"]) { name quantity } } }
+          }`, { id: inventoryItemId, loc: locationId });
+        if (cur.errors) return err(JSON.stringify(cur.errors));
+        const levels = (cur.data?.inventoryItem as { inventoryLevel?: { quantities?: { name: string; quantity: number }[] } })?.inventoryLevel?.quantities || [];
+        const compareQuantity = levels.find((q) => q.name === name)?.quantity ?? 0;
+        const res = await shopifyGql(store, `
+          mutation SetInv($input: InventorySetQuantitiesInput!) {
+            inventorySetQuantities(input: $input) {
+              inventoryAdjustmentGroup { createdAt reason }
+              userErrors { field message }
+            }
+          }`, { input: { name, reason: "correction", quantities: [{ inventoryItemId, locationId, quantity, compareQuantity }] } });
+        if (res.errors) return err(JSON.stringify(res.errors));
+        return ok({ store: store.name, ...(res.data?.inventorySetQuantities as object) });
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
+  server.registerTool(
+    "supliful_create_discount",
+    {
+      description: "Create a basic percentage discount code (applies to all products).",
+      inputSchema: {
+        store: storeSchema(),
+        title: z.string(),
+        code: z.string(),
+        percentage: z.number().min(1).max(100).describe("Percent off, e.g. 20 for 20%"),
+        startsAt: z.string().optional().describe("ISO datetime; defaults to now"),
+        endsAt: z.string().optional(),
+        usageLimit: z.number().int().optional(),
+      },
+    },
+    async ({ store: storeKey, title, code, percentage, startsAt, endsAt, usageLimit }) => {
+      const store = resolveStore(storeKey);
+      const basicCodeDiscount: Record<string, unknown> = {
+        title, code,
+        startsAt: startsAt || new Date().toISOString(),
+        customerGets: { value: { percentage: percentage / 100 }, items: { all: true } },
+      };
+      if (endsAt) basicCodeDiscount.endsAt = endsAt;
+      if (usageLimit !== undefined) basicCodeDiscount.usageLimit = usageLimit;
+      try {
+        const res = await shopifyGql(store, `
+          mutation CreateDiscount($basicCodeDiscount: DiscountCodeBasicInput!) {
+            discountCodeBasicCreate(basicCodeDiscount: $basicCodeDiscount) {
+              codeDiscountNode { id }
+              userErrors { field message }
+            }
+          }`, { basicCodeDiscount });
+        if (res.errors) return err(JSON.stringify(res.errors));
+        return ok({ store: store.name, ...(res.data?.discountCodeBasicCreate as object) });
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
+  server.registerTool(
+    "supliful_get_collection",
+    {
+      description: "Get a collection's details by GID.",
+      inputSchema: { store: storeSchema(), id: z.string().describe("Collection GID") },
+    },
+    async ({ store: storeKey, id }) => {
+      const store = resolveStore(storeKey);
+      try {
+        const res = await shopifyGql(store, `
+          query($id: ID!) {
+            collection(id: $id) {
+              id title handle descriptionHtml updatedAt sortOrder
+              productsCount { count }
+              image { url altText }
+            }
+          }`, { id });
+        if (res.errors) return err(JSON.stringify(res.errors));
+        return ok(res.data?.collection);
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
+  server.registerTool(
+    "supliful_create_collection",
+    {
+      description: "Create a manual collection.",
+      inputSchema: {
+        store: storeSchema(),
+        title: z.string(),
+        descriptionHtml: z.string().optional(),
+      },
+    },
+    async ({ store: storeKey, title, descriptionHtml }) => {
+      const store = resolveStore(storeKey);
+      const input: Record<string, unknown> = { title };
+      if (descriptionHtml !== undefined) input.descriptionHtml = descriptionHtml;
+      try {
+        const res = await shopifyGql(store, `
+          mutation CreateCollection($input: CollectionInput!) {
+            collectionCreate(input: $input) {
+              collection { id title handle }
+              userErrors { field message }
+            }
+          }`, { input });
+        if (res.errors) return err(JSON.stringify(res.errors));
+        return ok({ store: store.name, ...(res.data?.collectionCreate as object) });
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
+  server.registerTool(
+    "supliful_add_to_collection",
+    {
+      description: "Add products to a manual collection.",
+      inputSchema: {
+        store: storeSchema(),
+        collectionId: z.string().describe("Collection GID"),
+        productIds: z.array(z.string()).describe("Product GIDs"),
+      },
+    },
+    async ({ store: storeKey, collectionId, productIds }) => {
+      const store = resolveStore(storeKey);
+      try {
+        const res = await shopifyGql(store, `
+          mutation AddToCollection($id: ID!, $productIds: [ID!]!) {
+            collectionAddProducts(id: $id, productIds: $productIds) {
+              collection { id title productsCount { count } }
+              userErrors { field message }
+            }
+          }`, { id: collectionId, productIds });
+        if (res.errors) return err(JSON.stringify(res.errors));
+        return ok({ store: store.name, ...(res.data?.collectionAddProducts as object) });
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
   return server;
 }
 
