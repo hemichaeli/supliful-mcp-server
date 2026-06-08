@@ -136,6 +136,25 @@ async function assertSuplifulReady(
   };
 }
 
+// ─── Gateway store guard ─────────────────────────────────────────────────────
+// GenoMAX Gateway is a non-selling "gateway" store: it must NEVER have ACTIVE
+// products. Any attempt to publish a product there is refused outright.
+function assertSellableStore(
+  store: StoreConfig,
+): { ok: true } | { ok: false; message: string } {
+  if (/gateway/i.test(store.name)) {
+    return {
+      ok: false,
+      message:
+        `🛑 BLOCKED — cannot publish on ${store.name}: it is a NON-SELLING gateway store.\n\n` +
+        `Hard rule: ${store.name} never sells products, so NO product may be set ACTIVE here — ` +
+        `it must stay DRAFT.\n\n` +
+        `Fix: publish on a selling store (MAXima or MAXimo) instead, connected through Supliful.`,
+    };
+  }
+  return { ok: true };
+}
+
 // ─── Server factory ──────────────────────────────────────────────────────────
 function createMcpServer(): McpServer {
   const server = new McpServer({ name: "supliful-mcp", version: "2.0.0" });
@@ -421,8 +440,16 @@ function createMcpServer(): McpServer {
     async ({ store: storeKey, id, title, descriptionHtml, tags, status, seoTitle, seoDescription }) => {
       const store = resolveStore(storeKey);
       if (status === "ACTIVE") {
+        const sellable = assertSellableStore(store);
+        if (!sellable.ok) {
+          console.error(`[GUARD] ${store.name}: blocked ACTIVE publish of ${id} — non-selling gateway store.`);
+          return err(sellable.message);
+        }
         const guard = await assertSuplifulReady(store, id);
-        if (!guard.ok) return err(guard.message);
+        if (!guard.ok) {
+          console.error(`[GUARD] ${store.name}: blocked ACTIVE publish of ${id} — not Supliful-ready.`);
+          return err(guard.message);
+        }
       }
       const input: Record<string, unknown> = { id };
       if (title !== undefined) input.title = title;
