@@ -289,8 +289,8 @@ function createMcpServer(): McpServer {
                   variants(first: 20) {
                     edges {
                       node {
-                        id title price compareAtPrice sku weight weightUnit availableForSale
-                        inventoryItem { id tracked fulfillmentService { serviceName handle } }
+                        id title price compareAtPrice sku availableForSale
+                        inventoryItem { id tracked measurement { weight { value unit } } }
                       }
                     }
                   }
@@ -325,10 +325,10 @@ function createMcpServer(): McpServer {
               variants(first: 30) {
                 edges {
                   node {
-                    id title price compareAtPrice sku weight weightUnit barcode availableForSale
+                    id title price compareAtPrice sku barcode availableForSale
                     inventoryItem {
                       id tracked measurement { weight { unit value } }
-                      fulfillmentService { serviceName handle }
+                      inventoryLevels(first: 5) { edges { node { location { name isFulfillmentService fulfillmentService { serviceName handle } } } } }
                     }
                   }
                 }
@@ -509,7 +509,7 @@ function createMcpServer(): McpServer {
                       node {
                         id title quantity sku
                         originalUnitPriceSet { shopMoney { amount currencyCode } }
-                        variant { id sku inventoryItem { fulfillmentService { serviceName } } }
+                        variant { id sku }
                       }
                     }
                   }
@@ -579,7 +579,7 @@ function createMcpServer(): McpServer {
                     id title quantity sku refundableQuantity
                     originalUnitPriceSet { shopMoney { amount currencyCode } }
                     discountedUnitPriceSet { shopMoney { amount currencyCode } }
-                    variant { id sku title price inventoryItem { fulfillmentService { serviceName handle } } }
+                    variant { id sku title price inventoryItem { id inventoryLevels(first: 5) { edges { node { location { name fulfillmentService { serviceName handle } } } } } } }
                   }
                 }
               }
@@ -1460,13 +1460,12 @@ function createMcpServer(): McpServer {
                     id title sku
                     inventoryItem {
                       id tracked
-                      fulfillmentService { serviceName handle }
                       inventoryLevels(first: 10) {
                         edges {
                           node {
                             id
                             quantities(names: ["available","on_hand","committed","incoming"]) { name quantity }
-                            location { id name }
+                            location { id name isFulfillmentService fulfillmentService { serviceName handle } }
                           }
                         }
                       }
