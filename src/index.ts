@@ -2059,6 +2059,94 @@ function createMcpServer(): McpServer {
     }
   );
 
+  server.registerTool(
+    "supliful_update_collection",
+    {
+      description: "Update a collection's title or description.",
+      inputSchema: {
+        store: storeSchema(),
+        id: z.string().describe("Collection GID"),
+        title: z.string().optional(),
+        descriptionHtml: z.string().optional(),
+      },
+    },
+    async ({ store: storeKey, id, title, descriptionHtml }) => {
+      const store = resolveStore(storeKey);
+      const input: Record<string, unknown> = { id };
+      if (title !== undefined) input.title = title;
+      if (descriptionHtml !== undefined) input.descriptionHtml = descriptionHtml;
+      try {
+        const res = await shopifyGql(store, `
+          mutation UpdateCollection($input: CollectionInput!) {
+            collectionUpdate(input: $input) {
+              collection { id title handle }
+              userErrors { field message }
+            }
+          }`, { input });
+        if (res.errors) return err(JSON.stringify(res.errors));
+        return ok({ store: store.name, ...(res.data?.collectionUpdate as object) });
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
+  // Attach image(s) to a product from public HTTPS URL(s); Shopify fetches them.
+  server.registerTool(
+    "supliful_add_product_image",
+    {
+      description: "Attach image(s) to a product from public HTTPS URL(s).",
+      inputSchema: {
+        store: storeSchema(),
+        productId: z.string().describe("Product GID"),
+        images: z.array(z.object({ url: z.string().url(), alt: z.string().optional() })).min(1),
+      },
+    },
+    async ({ store: storeKey, productId, images }) => {
+      const store = resolveStore(storeKey);
+      const media = images.map((i) => ({ originalSource: i.url, mediaContentType: "IMAGE", alt: i.alt }));
+      try {
+        const res = await shopifyGql(store, `
+          mutation AddMedia($product: ProductUpdateInput!, $media: [CreateMediaInput!]) {
+            productUpdate(product: $product, media: $media) {
+              product { id media(first: 20) { edges { node { ... on MediaImage { id image { url } } } } } }
+              userErrors { field message }
+            }
+          }`, { product: { id: productId }, media });
+        if (res.errors) return err(JSON.stringify(res.errors));
+        return ok({ store: store.name, ...(res.data?.productUpdate as object) });
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
+  // Arbitrary WRITE access to the Admin GraphQL API — but mutations that would
+  // set a product ACTIVE are refused, so the publish guards cannot be bypassed.
+  server.registerTool(
+    "supliful_graphql_mutation",
+    {
+      description: "Run an arbitrary Shopify Admin GraphQL mutation. Mutations that set a product ACTIVE are refused — publish via supliful_update_product / supliful_bulk_update_product_status (which enforce the guards).",
+      inputSchema: {
+        store: storeSchema(),
+        query: z.string().describe("A GraphQL mutation."),
+        variables: z.record(z.any()).optional(),
+      },
+    },
+    async ({ store: storeKey, query, variables }) => {
+      const store = resolveStore(storeKey);
+      const blob = `${query} ${JSON.stringify(variables || {})}`;
+      const touchesProductStatus = /product(create|update|set|changestatus|duplicate)/i.test(query);
+      if (touchesProductStatus && /active/i.test(blob)) {
+        return err(
+          "🛑 BLOCKED — this mutation appears to set a product ACTIVE. To publish, use " +
+          "supliful_update_product or supliful_bulk_update_product_status, which enforce the " +
+          "Supliful-readiness and non-selling-gateway publish guards.");
+      }
+      try {
+        const res = await shopifyGql(store, query, variables || {});
+        if (res.errors) return err(JSON.stringify(res.errors));
+        return ok({ store: store.name, data: res.data });
+      } catch (e) { return err(String(e)); }
+    }
+  );
+
   return server;
 }
 
