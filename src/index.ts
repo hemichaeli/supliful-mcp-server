@@ -1963,6 +1963,7 @@ function createMcpServer(): McpServer {
       const basicCodeDiscount: Record<string, unknown> = {
         title, code,
         startsAt: startsAt || new Date().toISOString(),
+        customerSelection: { all: true },
         customerGets: { value: { percentage: percentage / 100 }, items: { all: true } },
       };
       if (endsAt) basicCodeDiscount.endsAt = endsAt;
