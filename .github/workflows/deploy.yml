@@ -1,0 +1,41 @@
+name: Deploy to Railway
+
+# Push-to-deploy for main, independent of Railway's native GitHub integration.
+# CI checks out the code, builds it as a guard, then ships THAT code via `railway up`.
+# Requires one repo secret: RAILWAY_TOKEN (a Railway *project* token scoped to
+# project "supliful-mcp-server", environment "production").
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: railway-deploy-main
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build (compile guard — do not deploy a broken bundle)
+        run: npm run build
+
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+
+      - name: Deploy to Railway
+        run: railway up --service supliful-mcp-server --detach
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
