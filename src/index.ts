@@ -61,30 +61,60 @@ async function shopifyGql(
 }
 
 function ok(data: unknown): { content: [{ type: "text"; text: string }] } {
-  return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+  // Compact (no indentation) — every byte here is a token the LLM caller pays for.
+  return { content: [{ type: "text", text: JSON.stringify(data) }] };
 }
 function err(msg: string): { content: [{ type: "text"; text: string }] } {
   return { content: [{ type: "text", text: `ERROR: ${msg}` }] };
 }
 
-// Resolve store by key ("1","2","3") or name, defaulting to first store
+// Surface Shopify mutation userErrors as a failure. Shopify returns HTTP 200 with an
+// empty top-level `errors` but a populated `<rootField>.userErrors[]` when a write is
+// rejected by validation (bad price, stale inventory qty, address rejected, refund
+// mismatch, duplicate discount code, …). Without this check those rejected writes were
+// returned to the caller as success. Returns an err() result on userErrors, else null.
+function userErrorOf(
+  res: { data?: Record<string, unknown> },
+  rootField: string
+): { content: [{ type: "text"; text: string }] } | null {
+  const ue = (res.data?.[rootField] as
+    { userErrors?: { field?: string[] | string | null; message: string }[] } | undefined)?.userErrors;
+  if (ue && ue.length > 0) {
+    return err(
+      ue
+        .map((e) => `${Array.isArray(e.field) ? e.field.join(".") : e.field || "?"}: ${e.message}`)
+        .join("; ")
+    );
+  }
+  return null;
+}
+
+// Resolve store by key ("1","2","3") or name. Defaults to the first store ONLY
+// when no key is supplied. A provided-but-unknown key THROWS rather than silently
+// falling back to STORES[0] — silent fallback could route a write (or a publish)
+// to the wrong store and, since the publish guards key off store.name, around the
+// gateway guard. Throwing is guard-strengthening; the MCP SDK surfaces it as an error.
 function resolveStore(storeKey?: string): StoreConfig {
   if (!storeKey) return STORES[0];
-  return (
-    STORES.find((s) => s.key === storeKey || s.name.toLowerCase() === storeKey.toLowerCase()) ||
-    STORES[0]
+  const match = STORES.find(
+    (s) => s.key === storeKey || s.name.toLowerCase() === storeKey.toLowerCase()
   );
+  if (!match) {
+    throw new Error(
+      `Unknown store "${storeKey}". Valid options: ${STORES.map((s) => `"${s.key}" (${s.name})`).join(", ")}.`
+    );
+  }
+  return match;
 }
 
 function storeSchema() {
-  const keys = STORES.map((s) => s.key);
-  const names = STORES.map((s) => s.name);
-  const allOptions = [...new Set([...keys, ...names])];
+  // Keep this description short: it is duplicated into the static manifest of every
+  // store-scoped tool (~50x). Full key→name mapping lives in supliful_list_stores.
   return z
     .string()
     .optional()
     .describe(
-      `Which store to use. Options: ${STORES.map((s) => `"${s.key}" (${s.name})`).join(", ")}. Defaults to "${STORES[0].name}".`
+      `Store key "${STORES.map((s) => s.key).join("\"/\"")}" (default "${STORES[0].key}"=${STORES[0].name}). Call supliful_list_stores for names.`
     );
 }
 
@@ -179,8 +209,7 @@ function createMcpServer(): McpServer {
       },
     },
     async ({ email, first }) => {
-      const results: Record<string, unknown> = {};
-      for (const store of STORES) {
+      const entries = await Promise.all(STORES.map(async (store): Promise<[string, unknown]> => {
         try {
           const res = await shopifyGql(store, `
             query CrossStoreSearch($query: String!, $first: Int!) {
@@ -194,12 +223,12 @@ function createMcpServer(): McpServer {
                 }
               }
             }`, { query: `email:${email}`, first });
-          results[`${store.key}_${store.name}`] = res.errors ? { error: res.errors } : res.data?.orders;
+          return [`${store.key}_${store.name}`, res.errors ? { error: res.errors } : res.data?.orders];
         } catch (e) {
-          results[`${store.key}_${store.name}`] = { error: String(e) };
+          return [`${store.key}_${store.name}`, { error: String(e) }];
         }
-      }
-      return ok(results);
+      }));
+      return ok(Object.fromEntries(entries));
     }
   );
 
@@ -210,8 +239,7 @@ function createMcpServer(): McpServer {
       inputSchema: {},
     },
     async () => {
-      const results: Record<string, unknown> = {};
-      for (const store of STORES) {
+      const entries = await Promise.all(STORES.map(async (store): Promise<[string, unknown]> => {
         try {
           const res = await shopifyGql(store, `
             query UnfulfilledSummary {
@@ -228,16 +256,16 @@ function createMcpServer(): McpServer {
               }
             }`);
           const edges = (res.data?.orders as { edges: unknown[]; pageInfo: { hasNextPage: boolean } })?.edges || [];
-          results[`${store.key}_${store.name}`] = {
+          return [`${store.key}_${store.name}`, {
             count: edges.length,
             hasMore: (res.data?.orders as { pageInfo: { hasNextPage: boolean } })?.pageInfo?.hasNextPage,
             orders: edges,
-          };
+          }];
         } catch (e) {
-          results[`${store.key}_${store.name}`] = { error: String(e) };
+          return [`${store.key}_${store.name}`, { error: String(e) }];
         }
-      }
-      return ok(results);
+      }));
+      return ok(Object.fromEntries(entries));
     }
   );
 
@@ -252,8 +280,7 @@ function createMcpServer(): McpServer {
     },
     async ({ startDate, endDate }) => {
       const q = `created_at:>=${startDate} created_at:<=${endDate} financial_status:paid`;
-      const results: Record<string, unknown> = {};
-      for (const store of STORES) {
+      const entries = await Promise.all(STORES.map(async (store): Promise<[string, unknown]> => {
         try {
           const res = await shopifyGql(store, `
             query StoreSales($query: String!) {
@@ -264,17 +291,17 @@ function createMcpServer(): McpServer {
             }`, { query: q });
           const edges = (res.data?.orders as { edges: { node: { totalPriceSet: { shopMoney: { amount: string; currencyCode: string } } } }[] })?.edges || [];
           const total = edges.reduce((s, e) => s + parseFloat(e.node.totalPriceSet.shopMoney.amount), 0);
-          results[`${store.key}_${store.name}`] = {
+          return [`${store.key}_${store.name}`, {
             orderCount: edges.length,
             totalRevenue: total.toFixed(2),
             currency: edges[0]?.node.totalPriceSet.shopMoney.currencyCode ?? "USD",
             hasMore: (res.data?.orders as { pageInfo: { hasNextPage: boolean } })?.pageInfo?.hasNextPage,
-          };
+          }];
         } catch (e) {
-          results[`${store.key}_${store.name}`] = { error: String(e) };
+          return [`${store.key}_${store.name}`, { error: String(e) }];
         }
-      }
-      return ok({ period: { startDate, endDate }, stores: results });
+      }));
+      return ok({ period: { startDate, endDate }, stores: Object.fromEntries(entries) });
     }
   );
 
@@ -466,6 +493,7 @@ function createMcpServer(): McpServer {
             }
           }`, { input });
         if (res.errors) return err(JSON.stringify(res.errors));
+        { const ue = userErrorOf(res, "productUpdate"); if (ue) return ue; }
         return ok(res.data?.productUpdate);
       } catch (e) { return err(String(e)); }
     }
@@ -496,6 +524,7 @@ function createMcpServer(): McpServer {
             }
           }`, { productId, variants });
         if (res.errors) return err(JSON.stringify(res.errors));
+        { const ue = userErrorOf(res, "productVariantsBulkUpdate"); if (ue) return ue; }
         return ok(res.data?.productVariantsBulkUpdate);
       } catch (e) { return err(String(e)); }
     }
@@ -729,6 +758,7 @@ function createMcpServer(): McpServer {
             }
           }`, { orderId, reason, refund, notifyCustomer });
         if (res.errors) return err(JSON.stringify(res.errors));
+        { const ue = userErrorOf(res, "orderCancel"); if (ue) return ue; }
         return ok(res.data?.orderCancel);
       } catch (e) { return err(String(e)); }
     }
@@ -761,6 +791,7 @@ function createMcpServer(): McpServer {
             }
           }`, { input });
         if (res.errors) return err(JSON.stringify(res.errors));
+        { const ue = userErrorOf(res, "orderUpdate"); if (ue) return ue; }
         return ok(res.data?.orderUpdate);
       } catch (e) { return err(String(e)); }
     }
@@ -949,6 +980,7 @@ function createMcpServer(): McpServer {
             }
           }`, { orderId, shippingAddress });
         if (res.errors) return err(JSON.stringify(res.errors));
+        { const ue = userErrorOf(res, "orderUpdate"); if (ue) return ue; }
         return ok(res.data?.orderUpdate);
       } catch (e) { return err(String(e)); }
     }
@@ -984,6 +1016,7 @@ function createMcpServer(): McpServer {
             }
           }`, { input: { firstName, lastName, email, phone, note, tags, acceptsMarketing } });
         if (res.errors) return err(JSON.stringify(res.errors));
+        { const ue = userErrorOf(res, "customerCreate"); if (ue) return ue; }
         return ok(res.data?.customerCreate);
       } catch (e) { return err(String(e)); }
     }
@@ -1079,6 +1112,7 @@ function createMcpServer(): McpServer {
             }
           }`, { input: { id, firstName, lastName, email, phone, note, tags } });
         if (res.errors) return err(JSON.stringify(res.errors));
+        const ue = userErrorOf(res, "customerUpdate"); if (ue) return ue;
         return ok(res.data?.customerUpdate);
       } catch (e) { return err(String(e)); }
     }
@@ -1196,6 +1230,7 @@ function createMcpServer(): McpServer {
             }
           }`, { input: { orderId, note, refundLineItems, transactions, notify } });
         if (res.errors) return err(JSON.stringify(res.errors));
+        const ue = userErrorOf(res, "refundCreate"); if (ue) return ue;
         return ok(res.data?.refundCreate);
       } catch (e) { return err(String(e)); }
     }
@@ -1247,6 +1282,7 @@ function createMcpServer(): McpServer {
             }
           }`, { input: { lineItems, email, phone, shippingAddress, note, tags, customAttributes } });
         if (res.errors) return err(JSON.stringify(res.errors));
+        const ue = userErrorOf(res, "draftOrderCreate"); if (ue) return ue;
         return ok(res.data?.draftOrderCreate);
       } catch (e) { return err(String(e)); }
     }
@@ -1276,6 +1312,7 @@ function createMcpServer(): McpServer {
             }
           }`, { id: draftOrderId, paymentPending });
         if (res.errors) return err(JSON.stringify(res.errors));
+        const ue = userErrorOf(res, "draftOrderComplete"); if (ue) return ue;
         return ok(res.data?.draftOrderComplete);
       } catch (e) { return err(String(e)); }
     }
@@ -1380,6 +1417,7 @@ function createMcpServer(): McpServer {
             }
           }`, { topic, webhookSubscription: { callbackUrl, format: "JSON" } });
         if (res.errors) return err(JSON.stringify(res.errors));
+        { const ue = userErrorOf(res, "webhookSubscriptionCreate"); if (ue) return ue; }
         return ok(res.data?.webhookSubscriptionCreate);
       } catch (e) { return err(String(e)); }
     }
@@ -1402,6 +1440,7 @@ function createMcpServer(): McpServer {
             }
           }`, { id });
         if (res.errors) return err(JSON.stringify(res.errors));
+        { const ue = userErrorOf(res, "webhookSubscriptionDelete"); if (ue) return ue; }
         return ok(res.data?.webhookSubscriptionDelete);
       } catch (e) { return err(String(e)); }
     }
@@ -1545,12 +1584,14 @@ function createMcpServer(): McpServer {
         if (res.errors) return err(JSON.stringify(res.errors));
         const orders = (res.data?.orders as { edges: { node: { totalPriceSet: { shopMoney: { amount: string; currencyCode: string } } } }[] })?.edges || [];
         const total = orders.reduce((s, e) => s + parseFloat(e.node.totalPriceSet.shopMoney.amount), 0);
+        // Return only the computed summary — NOT the raw order list (use
+        // supliful_list_orders for rows). Dumping the full edges/nodes here was the
+        // single largest payload in the server.
         return ok({
           store: store.name, period: { startDate, endDate },
           orderCount: orders.length,
           totalRevenue: `${total.toFixed(2)} ${orders[0]?.node.totalPriceSet.shopMoney.currencyCode ?? "USD"}`,
           hasMore: (res.data?.orders as { pageInfo: { hasNextPage: boolean } })?.pageInfo?.hasNextPage,
-          orders: res.data?.orders,
         });
       } catch (e) { return err(String(e)); }
     }
@@ -1569,14 +1610,21 @@ function createMcpServer(): McpServer {
     async ({ store: storeKey, startDate, endDate }) => {
       const store = resolveStore(storeKey);
       const base = `created_at:>=${startDate} created_at:<=${endDate} financial_status:paid`;
-      const results: Record<string, number> = {};
-      for (const status of ["fulfilled", "unfulfilled", "partial", "restocked"]) {
-        try {
-          const res = await shopifyGql(store,
-            `query Count($query: String!) { orders(first: 250, query: $query) { edges { node { id } } } }`,
-            { query: `${base} fulfillment_status:${status}` });
-          results[status] = (res.data?.orders as { edges: unknown[] })?.edges?.length ?? 0;
-        } catch { results[status] = -1; }
+      const statuses = ["fulfilled", "unfulfilled", "partial", "restocked"] as const;
+      // One round-trip: count each status via an aliased ordersCount in a single query
+      // (was 4 serial fetches of up to 250 order ids each, just to read .length).
+      const aliased = statuses
+        .map((s) => `${s}: ordersCount(query: "${base} fulfillment_status:${s}") { count }`)
+        .join("\n");
+      const results: Record<string, number | { count: null; error: string }> = {};
+      try {
+        const res = await shopifyGql(store, `query Counts { ${aliased} }`);
+        if (res.errors) return err(JSON.stringify(res.errors));
+        for (const s of statuses) {
+          results[s] = (res.data?.[s] as { count: number })?.count ?? 0;
+        }
+      } catch (e) {
+        for (const s of statuses) results[s] = { count: null, error: String(e) };
       }
       return ok({ store: store.name, period: { startDate, endDate }, fulfillmentBreakdown: results });
     }
@@ -1732,8 +1780,9 @@ function createMcpServer(): McpServer {
     },
     async ({ store: storeKey }) => {
       const targets = storeKey ? [resolveStore(storeKey)] : STORES;
-      const results: Record<string, unknown> = {};
-      for (const store of targets) {
+      // Independent per-store checks — fan out in parallel (was serial, latency scaled
+      // linearly with store count).
+      const entries = await Promise.all(targets.map(async (store): Promise<[string, unknown]> => {
         try {
           const res = await shopifyGql(store, `
             query HealthCheck {
@@ -1742,21 +1791,21 @@ function createMcpServer(): McpServer {
                 fulfillmentServices { serviceName handle type inventoryManagement }
               }
             }`);
-          if (res.errors) { results[store.name] = { status: "error", errors: res.errors }; continue; }
+          if (res.errors) return [store.name, { status: "error", errors: res.errors }];
           const shop = res.data?.shop as { name: string; email: string; fulfillmentServices: { serviceName: string; handle: string }[] };
           const suplifulConnected = shop?.fulfillmentServices?.some(
             (f) => f.serviceName?.toLowerCase().includes("supliful") || f.handle?.toLowerCase().includes("supliful")
           );
-          results[store.name] = {
+          return [store.name, {
             status: "ok", domain: store.domain,
             shopName: shop?.name, shopEmail: shop?.email,
             suplifulConnected, fulfillmentServices: shop?.fulfillmentServices,
-          };
+          }];
         } catch (e) {
-          results[store.name] = { status: "error", error: String(e) };
+          return [store.name, { status: "error", error: String(e) }];
         }
-      }
-      return ok({ shopifyApiVersion: SHOPIFY_API_VERSION, stores: results });
+      }));
+      return ok({ shopifyApiVersion: SHOPIFY_API_VERSION, stores: Object.fromEntries(entries) });
     }
   );
 
@@ -1865,6 +1914,7 @@ function createMcpServer(): McpServer {
             productUpdate(input: $input) { product { id title status } userErrors { field message } }
           }`, { input: { id: product.id, status: "ACTIVE" } });
         if (upd.errors) return err(JSON.stringify(upd.errors));
+        { const ue = userErrorOf(upd, "productUpdate"); if (ue) return ue; }
         return ok({ store: store.name, ...(upd.data?.productUpdate as object) });
       } catch (e) { return err(String(e)); }
     }
@@ -1939,6 +1989,7 @@ function createMcpServer(): McpServer {
             }
           }`, { input: { name, reason: "correction", quantities: [{ inventoryItemId, locationId, quantity, compareQuantity }] } });
         if (res.errors) return err(JSON.stringify(res.errors));
+        { const ue = userErrorOf(res, "inventorySetQuantities"); if (ue) return ue; }
         return ok({ store: store.name, ...(res.data?.inventorySetQuantities as object) });
       } catch (e) { return err(String(e)); }
     }
@@ -1977,6 +2028,7 @@ function createMcpServer(): McpServer {
             }
           }`, { basicCodeDiscount });
         if (res.errors) return err(JSON.stringify(res.errors));
+        { const ue = userErrorOf(res, "discountCodeBasicCreate"); if (ue) return ue; }
         return ok({ store: store.name, ...(res.data?.discountCodeBasicCreate as object) });
       } catch (e) { return err(String(e)); }
     }
@@ -2028,6 +2080,7 @@ function createMcpServer(): McpServer {
             }
           }`, { input });
         if (res.errors) return err(JSON.stringify(res.errors));
+        { const ue = userErrorOf(res, "collectionCreate"); if (ue) return ue; }
         return ok({ store: store.name, ...(res.data?.collectionCreate as object) });
       } catch (e) { return err(String(e)); }
     }
@@ -2054,6 +2107,7 @@ function createMcpServer(): McpServer {
             }
           }`, { id: collectionId, productIds });
         if (res.errors) return err(JSON.stringify(res.errors));
+        { const ue = userErrorOf(res, "collectionAddProducts"); if (ue) return ue; }
         return ok({ store: store.name, ...(res.data?.collectionAddProducts as object) });
       } catch (e) { return err(String(e)); }
     }
@@ -2084,6 +2138,7 @@ function createMcpServer(): McpServer {
             }
           }`, { input });
         if (res.errors) return err(JSON.stringify(res.errors));
+        { const ue = userErrorOf(res, "collectionUpdate"); if (ue) return ue; }
         return ok({ store: store.name, ...(res.data?.collectionUpdate as object) });
       } catch (e) { return err(String(e)); }
     }
@@ -2112,6 +2167,7 @@ function createMcpServer(): McpServer {
             }
           }`, { product: { id: productId }, media });
         if (res.errors) return err(JSON.stringify(res.errors));
+        { const ue = userErrorOf(res, "productUpdate"); if (ue) return ue; }
         return ok({ store: store.name, ...(res.data?.productUpdate as object) });
       } catch (e) { return err(String(e)); }
     }
@@ -2132,8 +2188,13 @@ function createMcpServer(): McpServer {
     async ({ store: storeKey, query, variables }) => {
       const store = resolveStore(storeKey);
       const blob = `${query} ${JSON.stringify(variables || {})}`;
-      const touchesProductStatus = /product(create|update|set|changestatus|duplicate)/i.test(query);
-      if (touchesProductStatus && /active/i.test(blob)) {
+      // Whole-word field match (was a loose substring that false-positived on
+      // "inactive"/"proactive"). Pair with the uppercase ACTIVE enum (case-sensitive
+      // \bACTIVE\b) so a status set via a query literal OR a variable value is caught,
+      // while benign text mentioning "active" is not. Guard-strengthening only.
+      const touchesProductMutation =
+        /\b(productCreate|productUpdate|productSet|productChangeStatus|productDuplicate)\b/.test(query);
+      if (touchesProductMutation && /\bACTIVE\b/.test(blob)) {
         return err(
           "🛑 BLOCKED — this mutation appears to set a product ACTIVE. To publish, use " +
           "supliful_update_product or supliful_bulk_update_product_status, which enforce the " +
@@ -2181,7 +2242,20 @@ const httpServer = http.createServer((req, res) => {
     if (!transport) { res.writeHead(404); res.end("Session not found"); return; }
     let body = "";
     req.on("data", (chunk) => (body += chunk));
-    req.on("end", () => { transport.handlePostMessage(req, res, body ? JSON.parse(body) : undefined); });
+    req.on("error", () => { if (!res.headersSent) { res.writeHead(400); res.end("Request error"); } });
+    req.on("end", () => {
+      // Guard JSON.parse: a malformed body used to throw synchronously inside this
+      // callback as an uncaught exception, which can take down the SSE server for
+      // all sessions. Reply 400 instead.
+      let parsed: unknown;
+      try {
+        parsed = body ? JSON.parse(body) : undefined;
+      } catch {
+        res.writeHead(400); res.end("Invalid JSON");
+        return;
+      }
+      transport.handlePostMessage(req, res, parsed);
+    });
     return;
   }
 
