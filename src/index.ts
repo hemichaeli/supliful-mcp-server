@@ -48,7 +48,22 @@ function resolveStore(storeKey?: string): StoreConfig {
 }
 
 function storeSchema() {
-  return z.string().optional().describe(`Store key "${STORES.map((s) => s.key).join("\"|\"")}\" (default "${STORES[0].key}"=${STORES[0].name}). Call supliful_list_stores for names.`);
+  // Build a clear, unambiguous description for the LLM.
+  // Example: 'Which store to use. Pass "1" for GenoMAX Gateway, "2" for MAXima, "3" for MAXimo. Defaults to "1" (GenoMAX Gateway).'
+  const opts = STORES.map((s) => `"${s.key}" for ${s.name}`).join(", ");
+  return z.string().optional().describe(
+    `Which store to use. Pass ${opts}. Defaults to "${STORES[0].key}" (${STORES[0].name}).`
+  );
+}
+
+// Scope-gated error: when Shopify returns ACCESS_DENIED, explain how to fix it.
+function scopeError(scope: string, store: StoreConfig): { content: [{ type: "text"; text: string }] } {
+  return err(
+    `ACCESS_DENIED on ${store.name}: the Shopify app token is missing the "${scope}" scope. ` +
+    `Fix: go to Shopify Partner Dashboard -> Apps -> [your app] -> App setup -> ` +
+    `Admin API access scopes, add "${scope}", then reinstall the app on the store ` +
+    `and update the token in Railway env vars (STORE1_TOKEN / STORE2_TOKEN / STORE3_TOKEN).`
+  );
 }
 
 async function assertSuplifulReady(store: StoreConfig, productId: string): Promise<{ ok: true } | { ok: false; message: string }> {
@@ -71,7 +86,7 @@ function assertSellableStore(store: StoreConfig): { ok: true } | { ok: false; me
 }
 
 function createMcpServer(): McpServer {
-  const server = new McpServer({ name: "supliful-mcp", version: "3.0.0" });
+  const server = new McpServer({ name: "supliful-mcp", version: "3.1.0" });
 
   // MULTI-STORE
   server.registerTool("supliful_list_stores", { description: "List all configured Shopify stores connected to this Supliful MCP server.", inputSchema: {} }, async () => ok(STORES.map((s) => ({ key: s.key, name: s.name, domain: s.domain }))));
@@ -432,22 +447,26 @@ function createMcpServer(): McpServer {
     });
 
   // THEMES (read_themes / write_themes)
-  server.registerTool("supliful_list_themes", { description: "List all themes in a store (read_themes scope).", inputSchema: { store: storeSchema() } },
+  server.registerTool("supliful_list_themes", { description: "List all themes in a store. Requires read_themes scope on the Shopify app token.", inputSchema: { store: storeSchema() } },
     async ({ store: storeKey }) => {
       const store = resolveStore(storeKey);
-      try { const res = await shopifyGql(store, `query { themes(first: 20) { edges { node { id name role createdAt updatedAt themeStoreId } } } }`); if (res.errors) return err(JSON.stringify(res.errors)); return ok({ store: store.name, ...res.data?.themes as object }); } catch (e) { return err(String(e)); }
+      try {
+        const res = await shopifyGql(store, `query { themes(first: 20) { edges { node { id name role createdAt updatedAt themeStoreId } } } }`);
+        if (res.errors) { const e0 = res.errors[0] as { extensions?: { code?: string } }; if (e0?.extensions?.code === "ACCESS_DENIED") return scopeError("read_themes", store); return err(JSON.stringify(res.errors)); }
+        return ok({ store: store.name, ...res.data?.themes as object });
+      } catch (e) { return err(String(e)); }
     });
 
   server.registerTool("supliful_publish_theme", { description: "Publish a theme (make it live). Requires write_themes scope.", inputSchema: { store: storeSchema(), id: z.string() } },
     async ({ store: storeKey, id }) => {
       const store = resolveStore(storeKey);
-      try { const res = await shopifyGql(store, `mutation PublishTheme($id: ID!) { themePublish(id: $id) { theme { id name role } userErrors { field message } } }`, { id }); if (res.errors) return err(JSON.stringify(res.errors)); { const ue = userErrorOf(res, "themePublish"); if (ue) return ue; } return ok({ store: store.name, ...res.data?.themePublish as object }); } catch (e) { return err(String(e)); }
+      try { const res = await shopifyGql(store, `mutation PublishTheme($id: ID!) { themePublish(id: $id) { theme { id name role } userErrors { field message } } }`, { id }); if (res.errors) { const e0 = res.errors[0] as { extensions?: { code?: string } }; if (e0?.extensions?.code === "ACCESS_DENIED") return scopeError("write_themes", store); return err(JSON.stringify(res.errors)); } { const ue = userErrorOf(res, "themePublish"); if (ue) return ue; } return ok({ store: store.name, ...res.data?.themePublish as object }); } catch (e) { return err(String(e)); }
     });
 
   server.registerTool("supliful_delete_theme", { description: "Delete an unpublished theme. Requires write_themes scope.", inputSchema: { store: storeSchema(), id: z.string() } },
     async ({ store: storeKey, id }) => {
       const store = resolveStore(storeKey);
-      try { const res = await shopifyGql(store, `mutation DeleteTheme($id: ID!) { themeDelete(id: $id) { deletedThemeId userErrors { field message } } }`, { id }); if (res.errors) return err(JSON.stringify(res.errors)); { const ue = userErrorOf(res, "themeDelete"); if (ue) return ue; } return ok({ store: store.name, ...res.data?.themeDelete as object }); } catch (e) { return err(String(e)); }
+      try { const res = await shopifyGql(store, `mutation DeleteTheme($id: ID!) { themeDelete(id: $id) { deletedThemeId userErrors { field message } } }`, { id }); if (res.errors) { const e0 = res.errors[0] as { extensions?: { code?: string } }; if (e0?.extensions?.code === "ACCESS_DENIED") return scopeError("write_themes", store); return err(JSON.stringify(res.errors)); } { const ue = userErrorOf(res, "themeDelete"); if (ue) return ue; } return ok({ store: store.name, ...res.data?.themeDelete as object }); } catch (e) { return err(String(e)); }
     });
 
   // METAFIELDS
@@ -470,32 +489,40 @@ function createMcpServer(): McpServer {
     });
 
   // FILES (read_files / write_files)
-  server.registerTool("supliful_list_files", { description: "List files uploaded to the Shopify store (images, videos, generic files).", inputSchema: { store: storeSchema(), first: z.number().optional().default(20), after: z.string().optional(), query: z.string().optional().describe("e.g. 'media_type:IMAGE'") } },
+  server.registerTool("supliful_list_files", { description: "List files in the Shopify store. Requires read_files scope.", inputSchema: { store: storeSchema(), first: z.number().optional().default(20), after: z.string().optional(), query: z.string().optional().describe("e.g. 'media_type:IMAGE'") } },
     async ({ store: storeKey, first, after, query }) => {
       const store = resolveStore(storeKey);
-      try { const res = await shopifyGql(store, `query ListFiles($first: Int!, $after: String, $query: String) { files(first: $first, after: $after, query: $query, sortKey: UPDATED_AT, reverse: true) { edges { node { __typename ... on MediaImage { id alt createdAt updatedAt image { url width height } } ... on Video { id alt createdAt updatedAt sources { url mimeType } } ... on GenericFile { id alt createdAt updatedAt url } } } pageInfo { hasNextPage endCursor } } }`, { first, after, query }); if (res.errors) return err(JSON.stringify(res.errors)); return ok({ store: store.name, ...res.data?.files as object }); } catch (e) { return err(String(e)); }
+      try {
+        const res = await shopifyGql(store, `query ListFiles($first: Int!, $after: String, $query: String) { files(first: $first, after: $after, query: $query, sortKey: UPDATED_AT, reverse: true) { edges { node { __typename ... on MediaImage { id alt createdAt updatedAt image { url width height } } ... on Video { id alt createdAt updatedAt sources { url mimeType } } ... on GenericFile { id alt createdAt updatedAt url } } } pageInfo { hasNextPage endCursor } } }`, { first, after, query });
+        if (res.errors) { const e0 = res.errors[0] as { extensions?: { code?: string } }; if (e0?.extensions?.code === "ACCESS_DENIED") return scopeError("read_files", store); return err(JSON.stringify(res.errors)); }
+        return ok({ store: store.name, ...res.data?.files as object });
+      } catch (e) { return err(String(e)); }
     });
 
-  server.registerTool("supliful_upload_file_from_url", { description: "Upload a file to Shopify Files from a public HTTPS URL.", inputSchema: { store: storeSchema(), url: z.string().url(), alt: z.string().optional(), contentType: z.enum(["IMAGE", "VIDEO", "FILE"]).optional().default("IMAGE") } },
+  server.registerTool("supliful_upload_file_from_url", { description: "Upload a file to Shopify Files from a public HTTPS URL. Requires write_files scope.", inputSchema: { store: storeSchema(), url: z.string().url(), alt: z.string().optional(), contentType: z.enum(["IMAGE", "VIDEO", "FILE"]).optional().default("IMAGE") } },
     async ({ store: storeKey, url, alt, contentType }) => {
       const store = resolveStore(storeKey);
-      try { const res = await shopifyGql(store, `mutation CreateFile($files: [FileCreateInput!]!) { fileCreate(files: $files) { files { __typename ... on MediaImage { id image { url } } ... on GenericFile { id url } } userErrors { field message } } }`, { files: [{ originalSource: url, alt, contentType }] }); if (res.errors) return err(JSON.stringify(res.errors)); { const ue = userErrorOf(res, "fileCreate"); if (ue) return ue; } return ok({ store: store.name, ...res.data?.fileCreate as object }); } catch (e) { return err(String(e)); }
+      try { const res = await shopifyGql(store, `mutation CreateFile($files: [FileCreateInput!]!) { fileCreate(files: $files) { files { __typename ... on MediaImage { id image { url } } ... on GenericFile { id url } } userErrors { field message } } }`, { files: [{ originalSource: url, alt, contentType }] }); if (res.errors) { const e0 = res.errors[0] as { extensions?: { code?: string } }; if (e0?.extensions?.code === "ACCESS_DENIED") return scopeError("write_files", store); return err(JSON.stringify(res.errors)); } { const ue = userErrorOf(res, "fileCreate"); if (ue) return ue; } return ok({ store: store.name, ...res.data?.fileCreate as object }); } catch (e) { return err(String(e)); }
     });
 
-  server.registerTool("supliful_delete_file", { description: "Delete files from Shopify Files.", inputSchema: { store: storeSchema(), fileIds: z.array(z.string()) } },
+  server.registerTool("supliful_delete_file", { description: "Delete files from Shopify Files. Requires write_files scope.", inputSchema: { store: storeSchema(), fileIds: z.array(z.string()) } },
     async ({ store: storeKey, fileIds }) => {
       const store = resolveStore(storeKey);
       try { const res = await shopifyGql(store, `mutation DeleteFiles($fileIds: [ID!]!) { fileDelete(fileIds: $fileIds) { deletedFileIds userErrors { field message } } }`, { fileIds }); if (res.errors) return err(JSON.stringify(res.errors)); { const ue = userErrorOf(res, "fileDelete"); if (ue) return ue; } return ok({ store: store.name, ...res.data?.fileDelete as object }); } catch (e) { return err(String(e)); }
     });
 
   // GIFT CARDS (read_gift_cards / write_gift_cards)
-  server.registerTool("supliful_list_gift_cards", { description: "List gift cards in a store.", inputSchema: { store: storeSchema(), first: z.number().optional().default(20), status: z.enum(["ENABLED", "DISABLED", "EXPIRED", "REDEEMED"]).optional() } },
+  server.registerTool("supliful_list_gift_cards", { description: "List gift cards in a store. Requires read_gift_cards scope.", inputSchema: { store: storeSchema(), first: z.number().optional().default(20), status: z.enum(["ENABLED", "DISABLED", "EXPIRED", "REDEEMED"]).optional() } },
     async ({ store: storeKey, first, status }) => {
       const store = resolveStore(storeKey);
-      try { const res = await shopifyGql(store, `query ListGiftCards($first: Int!, $query: String) { giftCards(first: $first, query: $query) { edges { node { id maskedCode initialValue { amount currencyCode } balance { amount currencyCode } expiresOn createdAt customer { id email firstName lastName } } } pageInfo { hasNextPage endCursor } } }`, { first, query: status ? `status:${status}` : undefined }); if (res.errors) return err(JSON.stringify(res.errors)); return ok({ store: store.name, ...res.data?.giftCards as object }); } catch (e) { return err(String(e)); }
+      try {
+        const res = await shopifyGql(store, `query ListGiftCards($first: Int!, $query: String) { giftCards(first: $first, query: $query) { edges { node { id maskedCode initialValue { amount currencyCode } balance { amount currencyCode } expiresOn createdAt customer { id email firstName lastName } } } pageInfo { hasNextPage endCursor } } }`, { first, query: status ? `status:${status}` : undefined });
+        if (res.errors) { const e0 = res.errors[0] as { extensions?: { code?: string } }; if (e0?.extensions?.code === "ACCESS_DENIED") return scopeError("read_gift_cards", store); return err(JSON.stringify(res.errors)); }
+        return ok({ store: store.name, ...res.data?.giftCards as object });
+      } catch (e) { return err(String(e)); }
     });
 
-  server.registerTool("supliful_create_gift_card", { description: "Create a gift card and optionally assign it to a customer.", inputSchema: { store: storeSchema(), initialValue: z.string().describe("e.g. '25.00'"), customerId: z.string().optional(), expiresOn: z.string().optional(), note: z.string().optional(), sendEmailToCustomer: z.boolean().optional().default(false) } },
+  server.registerTool("supliful_create_gift_card", { description: "Create a gift card and optionally assign it to a customer. Requires write_gift_cards scope.", inputSchema: { store: storeSchema(), initialValue: z.string().describe("e.g. '25.00'"), customerId: z.string().optional(), expiresOn: z.string().optional(), note: z.string().optional(), sendEmailToCustomer: z.boolean().optional().default(false) } },
     async ({ store: storeKey, initialValue, customerId, expiresOn, note, sendEmailToCustomer }) => {
       const store = resolveStore(storeKey); const input: Record<string, unknown> = { initialValue, sendEmailToCustomer }; if (customerId) input.customerId = customerId; if (expiresOn) input.expiresOn = expiresOn; if (note) input.note = note;
       try { const res = await shopifyGql(store, `mutation CreateGiftCard($input: GiftCardCreateInput!) { giftCardCreate(input: $input) { giftCard { id maskedCode initialValue { amount currencyCode } balance { amount currencyCode } expiresOn } giftCardCode userErrors { field message } } }`, { input }); if (res.errors) return err(JSON.stringify(res.errors)); { const ue = userErrorOf(res, "giftCardCreate"); if (ue) return ue; } return ok({ store: store.name, ...res.data?.giftCardCreate as object }); } catch (e) { return err(String(e)); }
@@ -508,19 +535,23 @@ function createMcpServer(): McpServer {
       try { const res = await shopifyGql(store, `query { shop { name privacyPolicy { title body url } refundPolicy { title body url } termsOfService { title body url } shippingPolicy { title body url } contactInformation } }`); if (res.errors) return err(JSON.stringify(res.errors)); return ok(res.data?.shop); } catch (e) { return err(String(e)); }
     });
 
-  server.registerTool("supliful_list_pages", { description: "List online store pages (About, FAQ, etc.).", inputSchema: { store: storeSchema(), first: z.number().optional().default(20), query: z.string().optional() } },
+  server.registerTool("supliful_list_pages", { description: "List online store pages (About, FAQ, etc.). Requires read_content scope.", inputSchema: { store: storeSchema(), first: z.number().optional().default(20), query: z.string().optional() } },
     async ({ store: storeKey, first, query }) => {
       const store = resolveStore(storeKey);
-      try { const res = await shopifyGql(store, `query ListPages($first: Int!, $query: String) { pages(first: $first, query: $query, sortKey: UPDATED_AT, reverse: true) { edges { node { id title handle bodySummary createdAt updatedAt publishedAt isPublished } } pageInfo { hasNextPage endCursor } } }`, { first, query }); if (res.errors) return err(JSON.stringify(res.errors)); return ok({ store: store.name, ...res.data?.pages as object }); } catch (e) { return err(String(e)); }
+      try {
+        const res = await shopifyGql(store, `query ListPages($first: Int!, $query: String) { pages(first: $first, query: $query, sortKey: UPDATED_AT, reverse: true) { edges { node { id title handle bodySummary createdAt updatedAt publishedAt isPublished } } pageInfo { hasNextPage endCursor } } }`, { first, query });
+        if (res.errors) { const e0 = res.errors[0] as { extensions?: { code?: string } }; if (e0?.extensions?.code === "ACCESS_DENIED") return scopeError("read_content", store); return err(JSON.stringify(res.errors)); }
+        return ok({ store: store.name, ...res.data?.pages as object });
+      } catch (e) { return err(String(e)); }
     });
 
-  server.registerTool("supliful_get_page", { description: "Get full content of an online store page.", inputSchema: { store: storeSchema(), id: z.string().describe("Page GID") } },
+  server.registerTool("supliful_get_page", { description: "Get full content of an online store page. Requires read_content scope.", inputSchema: { store: storeSchema(), id: z.string().describe("Page GID") } },
     async ({ store: storeKey, id }) => {
       const store = resolveStore(storeKey);
       try { const res = await shopifyGql(store, `query GetPage($id: ID!) { page(id: $id) { id title handle body bodySummary createdAt updatedAt publishedAt isPublished seo { title description } } }`, { id }); if (res.errors) return err(JSON.stringify(res.errors)); return ok(res.data?.page); } catch (e) { return err(String(e)); }
     });
 
-  server.registerTool("supliful_upsert_page", { description: "Create or update an online store page.", inputSchema: { store: storeSchema(), id: z.string().optional().describe("Page GID (omit to create new)"), title: z.string(), body: z.string().describe("HTML body"), isPublished: z.boolean().optional().default(true), seoTitle: z.string().optional(), seoDescription: z.string().optional() } },
+  server.registerTool("supliful_upsert_page", { description: "Create or update an online store page. Requires write_content scope.", inputSchema: { store: storeSchema(), id: z.string().optional().describe("Page GID (omit to create new)"), title: z.string(), body: z.string().describe("HTML body"), isPublished: z.boolean().optional().default(true), seoTitle: z.string().optional(), seoDescription: z.string().optional() } },
     async ({ store: storeKey, id, title, body, isPublished, seoTitle, seoDescription }) => {
       const store = resolveStore(storeKey); const pageData: Record<string, unknown> = { title, body, isPublished }; if (seoTitle || seoDescription) pageData.seo = { title: seoTitle, description: seoDescription };
       const mutation = id ? `mutation UpdatePage($id: ID!, $page: PageUpdateInput!) { pageUpdate(id: $id, page: $page) { page { id title handle isPublished } userErrors { field message } } }` : `mutation CreatePage($page: PageCreateInput!) { pageCreate(page: $page) { page { id title handle isPublished } userErrors { field message } } }`;
@@ -528,19 +559,23 @@ function createMcpServer(): McpServer {
     });
 
   // BLOGS & ARTICLES
-  server.registerTool("supliful_list_blogs", { description: "List blogs in the online store.", inputSchema: { store: storeSchema() } },
+  server.registerTool("supliful_list_blogs", { description: "List blogs in the online store. Requires read_content scope.", inputSchema: { store: storeSchema() } },
     async ({ store: storeKey }) => {
       const store = resolveStore(storeKey);
-      try { const res = await shopifyGql(store, `query { blogs(first: 20) { edges { node { id title handle createdAt updatedAt } } } }`); if (res.errors) return err(JSON.stringify(res.errors)); return ok({ store: store.name, ...res.data?.blogs as object }); } catch (e) { return err(String(e)); }
+      try {
+        const res = await shopifyGql(store, `query { blogs(first: 20) { edges { node { id title handle createdAt updatedAt } } } }`);
+        if (res.errors) { const e0 = res.errors[0] as { extensions?: { code?: string } }; if (e0?.extensions?.code === "ACCESS_DENIED") return scopeError("read_content", store); return err(JSON.stringify(res.errors)); }
+        return ok({ store: store.name, ...res.data?.blogs as object });
+      } catch (e) { return err(String(e)); }
     });
 
-  server.registerTool("supliful_list_articles", { description: "List articles in a blog.", inputSchema: { store: storeSchema(), blogId: z.string(), first: z.number().optional().default(20) } },
+  server.registerTool("supliful_list_articles", { description: "List articles in a blog. Requires read_content scope.", inputSchema: { store: storeSchema(), blogId: z.string(), first: z.number().optional().default(20) } },
     async ({ store: storeKey, blogId, first }) => {
       const store = resolveStore(storeKey);
       try { const res = await shopifyGql(store, `query ListArticles($id: ID!, $first: Int!) { blog(id: $id) { id title articles(first: $first, sortKey: UPDATED_AT, reverse: true) { edges { node { id title handle publishedAt isPublished author { name } seo { title description } } } pageInfo { hasNextPage endCursor } } } }`, { id: blogId, first }); if (res.errors) return err(JSON.stringify(res.errors)); return ok(res.data?.blog); } catch (e) { return err(String(e)); }
     });
 
-  server.registerTool("supliful_create_article", { description: "Create a blog article.", inputSchema: { store: storeSchema(), blogId: z.string(), title: z.string(), body: z.string().describe("HTML body"), author: z.string().optional(), tags: z.array(z.string()).optional(), isPublished: z.boolean().optional().default(true), seoTitle: z.string().optional(), seoDescription: z.string().optional() } },
+  server.registerTool("supliful_create_article", { description: "Create a blog article. Requires write_content scope.", inputSchema: { store: storeSchema(), blogId: z.string(), title: z.string(), body: z.string().describe("HTML body"), author: z.string().optional(), tags: z.array(z.string()).optional(), isPublished: z.boolean().optional().default(true), seoTitle: z.string().optional(), seoDescription: z.string().optional() } },
     async ({ store: storeKey, blogId, title, body, author, tags, isPublished, seoTitle, seoDescription }) => {
       const store = resolveStore(storeKey); const article: Record<string, unknown> = { title, body, isPublished }; if (author) article.author = { name: author }; if (tags) article.tags = tags; if (seoTitle || seoDescription) article.seo = { title: seoTitle, description: seoDescription };
       try { const res = await shopifyGql(store, `mutation CreateArticle($blogId: ID!, $article: ArticleCreateInput!) { articleCreate(blogId: $blogId, article: $article) { article { id title handle isPublished publishedAt } userErrors { field message } } }`, { blogId, article }); if (res.errors) return err(JSON.stringify(res.errors)); { const ue = userErrorOf(res, "articleCreate"); if (ue) return ue; } return ok({ store: store.name, ...res.data?.articleCreate as object }); } catch (e) { return err(String(e)); }
@@ -593,7 +628,7 @@ function createMcpServer(): McpServer {
       const entries = await Promise.all(targets.map(async (store): Promise<[string, unknown]> => {
         try { const res = await shopifyGql(store, `query HealthCheck { shop { name email fulfillmentServices { serviceName handle type inventoryManagement } } }`); if (res.errors) return [store.name, { status: "error", errors: res.errors }]; const shop = res.data?.shop as { name: string; email: string; fulfillmentServices: { serviceName: string; handle: string }[] }; const suplifulConnected = shop?.fulfillmentServices?.some((f) => f.serviceName?.toLowerCase().includes("supliful") || f.handle?.toLowerCase().includes("supliful")); return [store.name, { status: "ok", domain: store.domain, shopName: shop?.name, shopEmail: shop?.email, suplifulConnected, fulfillmentServices: shop?.fulfillmentServices }]; } catch (e) { return [store.name, { status: "error", error: String(e) }]; }
       }));
-      return ok({ version: "3.0.0", shopifyApiVersion: SHOPIFY_API_VERSION, stores: Object.fromEntries(entries) });
+      return ok({ version: "3.1.0", shopifyApiVersion: SHOPIFY_API_VERSION, stores: Object.fromEntries(entries) });
     });
 
   server.registerTool("supliful_get_api_rate_limit", { description: "Check remaining Shopify API rate limit quota for a store.", inputSchema: { store: storeSchema() } },
@@ -603,14 +638,14 @@ function createMcpServer(): McpServer {
     });
 
   // GRAPHQL PASSTHROUGH
-  server.registerTool("supliful_graphql_query", { description: "Run an arbitrary READ-ONLY Shopify Admin GraphQL query. Mutations are rejected.", inputSchema: { store: storeSchema(), query: z.string().describe("A GraphQL query (read-only). Must not contain mutation."), variables: z.record(z.any()).optional() } },
+  server.registerTool("supliful_graphql_query", { description: "Run an arbitrary READ-ONLY Shopify Admin GraphQL query on any store. ALWAYS pass the store param explicitly (e.g. '2' for MAXima). Mutations are rejected.", inputSchema: { store: storeSchema(), query: z.string().describe("A GraphQL query (read-only). Must not contain mutation."), variables: z.record(z.any()).optional() } },
     async ({ store: storeKey, query, variables }) => {
       const store = resolveStore(storeKey);
       if (/\bmutation\b/i.test(query)) return err("Read-only passthrough: mutations not allowed here. Use a dedicated write tool.");
       try { const res = await shopifyGql(store, query, variables || {}); if (res.errors) return err(JSON.stringify(res.errors)); return ok({ store: store.name, data: res.data }); } catch (e) { return err(String(e)); }
     });
 
-  server.registerTool("supliful_graphql_mutation", { description: "Run an arbitrary Shopify Admin GraphQL mutation. Mutations that set a product ACTIVE are refused.", inputSchema: { store: storeSchema(), query: z.string().describe("A GraphQL mutation."), variables: z.record(z.any()).optional() } },
+  server.registerTool("supliful_graphql_mutation", { description: "Run an arbitrary Shopify Admin GraphQL mutation on any store. ALWAYS pass the store param explicitly (e.g. '2' for MAXima). Mutations that set a product ACTIVE are refused.", inputSchema: { store: storeSchema(), query: z.string().describe("A GraphQL mutation."), variables: z.record(z.any()).optional() } },
     async ({ store: storeKey, query, variables }) => {
       const store = resolveStore(storeKey); const blob = `${query} ${JSON.stringify(variables || {})}`;
       const touchesProductMutation = /\b(productCreate|productUpdate|productSet|productChangeStatus|productDuplicate)\b/.test(query);
@@ -629,7 +664,7 @@ const httpServer = http.createServer((req, res) => {
 
   if (req.method === "GET" && url.pathname === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", service: "supliful-mcp", version: "3.0.0", stores: STORES.map((s) => ({ key: s.key, name: s.name, domain: s.domain })) }));
+    res.end(JSON.stringify({ status: "ok", service: "supliful-mcp", version: "3.1.0", stores: STORES.map((s) => ({ key: s.key, name: s.name, domain: s.domain })) }));
     return;
   }
 
@@ -663,7 +698,7 @@ const httpServer = http.createServer((req, res) => {
 });
 
 httpServer.listen(PORT, () => {
-  console.log(`Supliful MCP Server v3.0 running on port ${PORT}`);
+  console.log(`Supliful MCP Server v3.1 running on port ${PORT}`);
   console.log(`Stores: ${STORES.map((s) => `${s.name} (${s.domain})`).join(" | ")}`);
   console.log(`SSE: http://localhost:${PORT}/sse`);
 });
